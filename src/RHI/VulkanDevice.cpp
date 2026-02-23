@@ -48,7 +48,7 @@ void VulkanDevice::PickPhysicalDevice(VkInstance instance, VkSurfaceKHR surface)
         vkGetPhysicalDeviceProperties(device, &props);
 
         if (props.apiVersion < VK_API_VERSION_1_3) {
-            LOG_WARN("Skipping {} — does not support Vulkan 1.3", props.deviceName);
+            LOG_WARN("Skipping {} - does not support Vulkan 1.3", props.deviceName);
             continue;
         }
 

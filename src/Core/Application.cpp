@@ -102,6 +102,8 @@ void Application::InitVulkan() {
     mCommandBuffers.Initialize(mDevice.GetHandle(), mDevice.GetQueueFamilyIndices().graphicsFamily,
                                mSwapchain.GetImageCount());
 
+    mImageFences.resize(mSwapchain.GetImageCount(), VK_NULL_HANDLE);
+
     CreateTriangleResources();
     CreatePipeline();
 
@@ -214,12 +216,12 @@ void Application::CreatePipeline() {
     dynamicState.dynamicStateCount = 2;
     dynamicState.pDynamicStates    = dynamicStates;
 
-    // Pipeline layout (empty — no descriptors or push constants yet)
+    // Pipeline layout (empty - no descriptors or push constants yet)
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     VK_CHECK(vkCreatePipelineLayout(mDevice.GetHandle(), &layoutInfo, nullptr, &mPipelineLayout));
 
-    // Dynamic rendering — specify color attachment format, no render pass
+    // Dynamic rendering - specify color attachment format, no render pass
     VkFormat colorFormat = mSwapchain.GetImageFormat();
     VkPipelineRenderingCreateInfo renderingInfo{};
     renderingInfo.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
@@ -280,11 +282,16 @@ void Application::MainLoop() {
 // Draw frame
 // -----------------------------------------------------------------------
 void Application::DrawFrame() {
-    auto device = mDevice.GetHandle();
+    auto device    = mDevice.GetHandle();
+    auto frameFence = mSync.GetFence(mFrameIndex);
 
-    // Pick acquire semaphore from a rolling ring (indexed independently of image).
-    VkSemaphore acquireSemaphore = mSync.GetImageAvailableSemaphore(mAcquireSemaphoreIndex);
-    mAcquireSemaphoreIndex = (mAcquireSemaphoreIndex + 1) % mSync.GetCount();
+    // 1. Wait for the frame fence. This guarantees the submit from N frames ago
+    //    (which consumed acquireSem[mFrameIndex]) has completed on the GPU,
+    //    so acquireSem[mFrameIndex] is safe to reuse.
+    vkWaitForFences(device, 1, &frameFence, VK_TRUE, UINT64_MAX);
+
+    // 2. Acquire next swapchain image.
+    VkSemaphore acquireSemaphore = mSync.GetImageAvailableSemaphore(mFrameIndex);
 
     uint32_t imageIndex = 0;
     VkResult result = vkAcquireNextImageKHR(
@@ -296,18 +303,21 @@ void Application::DrawFrame() {
         return;
     }
 
-    // Wait for any previous work on THIS image to finish.
-    // When acquire returns imageIndex, the presentation engine has released it,
-    // so renderFinishedSemaphore[imageIndex] from the last present is consumed and safe to reuse.
-    VkFence imageFence = mSync.GetFence(imageIndex);
-    vkWaitForFences(device, 1, &imageFence, VK_TRUE, UINT64_MAX);
-    vkResetFences(device, 1, &imageFence);
+    // 3. If a different frame is still using this image's resources (command buffer,
+    //    render-finished semaphore), wait for that frame's fence too.
+    if (mImageFences[imageIndex] != VK_NULL_HANDLE && mImageFences[imageIndex] != frameFence) {
+        vkWaitForFences(device, 1, &mImageFences[imageIndex], VK_TRUE, UINT64_MAX);
+    }
+    mImageFences[imageIndex] = frameFence;
 
+    vkResetFences(device, 1, &frameFence);
+
+    // 4. Record commands for this image.
     auto cmd = mCommandBuffers.Begin(device, imageIndex);
     RecordCommandBuffer(cmd, imageIndex);
     mCommandBuffers.End(imageIndex);
 
-    // Submit — indexed by acquired image
+    // 5. Submit.
     VkSemaphore          waitSemaphores[]   = { acquireSemaphore };
     VkPipelineStageFlags waitStages[]       = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
     VkSemaphore          signalSemaphores[] = { mSync.GetRenderFinishedSemaphore(imageIndex) };
@@ -323,9 +333,9 @@ void Application::DrawFrame() {
     submitInfo.signalSemaphoreCount = 1;
     submitInfo.pSignalSemaphores    = signalSemaphores;
 
-    VK_CHECK(vkQueueSubmit(mDevice.GetGraphicsQueue(), 1, &submitInfo, imageFence));
+    VK_CHECK(vkQueueSubmit(mDevice.GetGraphicsQueue(), 1, &submitInfo, frameFence));
 
-    // Present
+    // 6. Present.
     VkSwapchainKHR swapchains[] = { mSwapchain.GetHandle() };
 
     VkPresentInfoKHR presentInfo{};
@@ -341,6 +351,8 @@ void Application::DrawFrame() {
         mFramebufferResized = false;
         RecreateSwapchain();
     }
+
+    mFrameIndex = (mFrameIndex + 1) % mSync.GetCount();
 }
 
 // -----------------------------------------------------------------------

@@ -8,6 +8,8 @@
 #include "RHI/VulkanSync.h"
 #include "RHI/VulkanMemory.h"
 
+#include <vector>
+
 class Application {
 public:
     void Run();
@@ -43,6 +45,10 @@ private:
     VkBuffer       mVertexBuffer          = VK_NULL_HANDLE;
     VmaAllocation  mVertexBufferAllocation = VK_NULL_HANDLE;
 
-    uint32_t mAcquireSemaphoreIndex = 0;
-    bool     mFramebufferResized    = false;
+    // Tracks which frame fence was last used for each swapchain image,
+    // so we can wait on it before reusing that image's command buffer / render semaphore.
+    std::vector<VkFence> mImageFences;
+
+    uint32_t mFrameIndex          = 0;
+    bool     mFramebufferResized  = false;
 };

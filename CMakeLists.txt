@@ -42,7 +42,16 @@ FetchContent_Declare(VulkanMemoryAllocator
     GIT_TAG        v3.1.0
 )
 
-FetchContent_MakeAvailable(volk glfw spdlog glm VulkanMemoryAllocator)
+# --- tinygltf (header-only glTF 2.0 loader, bundles stb_image) ---
+set(TINYGLTF_BUILD_LOADER_EXAMPLE OFF CACHE BOOL "" FORCE)
+set(TINYGLTF_HEADER_ONLY ON CACHE BOOL "" FORCE)
+set(TINYGLTF_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(tinygltf
+    GIT_REPOSITORY https://github.com/syoyo/tinygltf.git
+    GIT_TAG        v2.9.3
+)
+
+FetchContent_MakeAvailable(volk glfw spdlog glm VulkanMemoryAllocator tinygltf)
 
 # --- Shader compilation ---
 find_program(GLSLANG_VALIDATOR glslangValidator
@@ -82,6 +91,7 @@ add_dependencies(${PROJECT_NAME} Shaders)
 target_include_directories(${PROJECT_NAME} PRIVATE
     "${CMAKE_SOURCE_DIR}/src"
     "${vulkanmemoryallocator_SOURCE_DIR}/include"
+    "${tinygltf_SOURCE_DIR}"
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE

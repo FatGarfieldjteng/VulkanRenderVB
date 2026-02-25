@@ -5,6 +5,12 @@
 #include <algorithm>
 #include <cstring>
 
+static int ResolveTextureSource(const tinygltf::Model& model, int texIndex) {
+    if (texIndex >= 0 && texIndex < static_cast<int>(model.textures.size()))
+        return model.textures[texIndex].source;
+    return -1;
+}
+
 bool ModelLoader::LoadGLTF(const std::string& path, ModelData& outModel) {
     tinygltf::Model    gltfModel;
     tinygltf::TinyGLTF loader;
@@ -48,19 +54,30 @@ bool ModelLoader::LoadGLTF(const std::string& path, ModelData& outModel) {
         outModel.textures.push_back(std::move(tex));
     }
 
-    // --- materials ---
+    // --- materials (PBR metallic-roughness) ---
     for (const auto& mat : gltfModel.materials) {
         MaterialData material;
-        material.baseColorFactor = glm::vec4(
-            static_cast<float>(mat.pbrMetallicRoughness.baseColorFactor[0]),
-            static_cast<float>(mat.pbrMetallicRoughness.baseColorFactor[1]),
-            static_cast<float>(mat.pbrMetallicRoughness.baseColorFactor[2]),
-            static_cast<float>(mat.pbrMetallicRoughness.baseColorFactor[3]));
+        const auto& pbr = mat.pbrMetallicRoughness;
 
-        int texIndex = mat.pbrMetallicRoughness.baseColorTexture.index;
-        if (texIndex >= 0 && texIndex < static_cast<int>(gltfModel.textures.size())) {
-            material.baseColorTextureIndex = gltfModel.textures[texIndex].source;
-        }
+        material.baseColorFactor = glm::vec4(
+            static_cast<float>(pbr.baseColorFactor[0]),
+            static_cast<float>(pbr.baseColorFactor[1]),
+            static_cast<float>(pbr.baseColorFactor[2]),
+            static_cast<float>(pbr.baseColorFactor[3]));
+        material.metallicFactor  = static_cast<float>(pbr.metallicFactor);
+        material.roughnessFactor = static_cast<float>(pbr.roughnessFactor);
+
+        material.baseColorTextureIndex        = ResolveTextureSource(gltfModel, pbr.baseColorTexture.index);
+        material.metallicRoughnessTextureIndex = ResolveTextureSource(gltfModel, pbr.metallicRoughnessTexture.index);
+        material.normalTextureIndex           = ResolveTextureSource(gltfModel, mat.normalTexture.index);
+        material.occlusionTextureIndex        = ResolveTextureSource(gltfModel, mat.occlusionTexture.index);
+        material.emissiveTextureIndex         = ResolveTextureSource(gltfModel, mat.emissiveTexture.index);
+
+        material.emissiveFactor = glm::vec3(
+            static_cast<float>(mat.emissiveFactor[0]),
+            static_cast<float>(mat.emissiveFactor[1]),
+            static_cast<float>(mat.emissiveFactor[2]));
+
         outModel.materials.push_back(material);
     }
 
@@ -73,7 +90,6 @@ bool ModelLoader::LoadGLTF(const std::string& path, ModelData& outModel) {
             MeshData meshData;
             meshData.materialIndex = primitive.material;
 
-            // Positions
             const float* posData    = nullptr;
             const float* normalData = nullptr;
             const float* uvData     = nullptr;
@@ -119,7 +135,6 @@ bool ModelLoader::LoadGLTF(const std::string& path, ModelData& outModel) {
                                         : glm::vec2(0.0f);
             }
 
-            // Indices
             if (primitive.indices >= 0) {
                 const auto& accessor   = gltfModel.accessors[primitive.indices];
                 const auto& bufferView = gltfModel.bufferViews[accessor.bufferView];
@@ -154,7 +169,6 @@ bool ModelLoader::LoadGLTF(const std::string& path, ModelData& outModel) {
 }
 
 void ModelLoader::GenerateProceduralCube(ModelData& outModel) {
-    // 6 faces, 4 vertices each, CCW winding
     const glm::vec3 positions[8] = {
         {-0.5f, -0.5f, -0.5f}, { 0.5f, -0.5f, -0.5f},
         { 0.5f,  0.5f, -0.5f}, {-0.5f,  0.5f, -0.5f},
@@ -164,12 +178,12 @@ void ModelLoader::GenerateProceduralCube(ModelData& outModel) {
 
     struct FaceDef { int v[4]; glm::vec3 n; };
     const FaceDef faces[6] = {
-        {{4, 5, 6, 7}, { 0,  0,  1}}, // +Z
-        {{1, 0, 3, 2}, { 0,  0, -1}}, // -Z
-        {{5, 1, 2, 6}, { 1,  0,  0}}, // +X
-        {{0, 4, 7, 3}, {-1,  0,  0}}, // -X
-        {{7, 6, 2, 3}, { 0,  1,  0}}, // +Y
-        {{0, 1, 5, 4}, { 0, -1,  0}}, // -Y
+        {{4, 5, 6, 7}, { 0,  0,  1}},
+        {{1, 0, 3, 2}, { 0,  0, -1}},
+        {{5, 1, 2, 6}, { 1,  0,  0}},
+        {{0, 4, 7, 3}, {-1,  0,  0}},
+        {{7, 6, 2, 3}, { 0,  1,  0}},
+        {{0, 1, 5, 4}, { 0, -1,  0}},
     };
     const glm::vec2 uvs[4] = {{0, 1}, {1, 1}, {1, 0}, {0, 0}};
 
@@ -188,7 +202,6 @@ void ModelLoader::GenerateProceduralCube(ModelData& outModel) {
         mesh.indices.push_back(base + 3);
     }
 
-    // Checkerboard texture 256x256
     constexpr uint32_t texW = 256, texH = 256, tileSize = 32;
     TextureData tex;
     tex.width  = texW;
@@ -198,19 +211,32 @@ void ModelLoader::GenerateProceduralCube(ModelData& outModel) {
     for (uint32_t y = 0; y < texH; y++) {
         for (uint32_t x = 0; x < texW; x++) {
             bool white = ((x / tileSize) + (y / tileSize)) % 2 == 0;
-            uint8_t c  = white ? 230 : 50;
+            uint8_t cv  = white ? 230 : 50;
             uint32_t idx = (y * texW + x) * 4;
-            tex.pixels[idx + 0] = c;
-            tex.pixels[idx + 1] = c;
-            tex.pixels[idx + 2] = c;
+            tex.pixels[idx + 0] = cv;
+            tex.pixels[idx + 1] = cv;
+            tex.pixels[idx + 2] = cv;
             tex.pixels[idx + 3] = 255;
         }
     }
 
     MaterialData mat;
     mat.baseColorTextureIndex = 0;
+    mat.metallicFactor  = 0.0f;
+    mat.roughnessFactor = 0.5f;
 
     outModel.meshes.push_back(std::move(mesh));
     outModel.textures.push_back(std::move(tex));
     outModel.materials.push_back(mat);
+}
+
+void ModelLoader::GenerateGroundPlane(MeshData& outMesh, float halfSize) {
+    float uvScale = halfSize;
+    outMesh.vertices = {
+        {{-halfSize, 0, -halfSize}, {0, 1, 0}, {0,       0}},
+        {{ halfSize, 0, -halfSize}, {0, 1, 0}, {uvScale, 0}},
+        {{ halfSize, 0,  halfSize}, {0, 1, 0}, {uvScale, uvScale}},
+        {{-halfSize, 0,  halfSize}, {0, 1, 0}, {0,       uvScale}},
+    };
+    outMesh.indices = { 0, 2, 1, 0, 3, 2 };
 }

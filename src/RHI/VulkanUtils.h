@@ -7,7 +7,8 @@ inline void TransitionImage(VkCommandBuffer cmd, VkImage image,
                             VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess,
                             VkImageLayout oldLayout, VkImageLayout newLayout,
                             VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT,
-                            uint32_t baseMip = 0, uint32_t mipCount = 1)
+                            uint32_t baseMip = 0, uint32_t mipCount = 1,
+                            uint32_t baseLayer = 0, uint32_t layerCount = 1)
 {
     VkImageMemoryBarrier2 barrier{};
     barrier.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -20,7 +21,7 @@ inline void TransitionImage(VkCommandBuffer cmd, VkImage image,
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image               = image;
-    barrier.subresourceRange    = { aspect, baseMip, mipCount, 0, 1 };
+    barrier.subresourceRange    = { aspect, baseMip, mipCount, baseLayer, layerCount };
 
     VkDependencyInfo dep{};
     dep.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;

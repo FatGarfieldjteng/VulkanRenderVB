@@ -43,7 +43,7 @@ void Application::InitVulkan() {
     mMemory.Initialize(mVulkanInstance.GetHandle(), mDevice.GetPhysicalDevice(), mDevice.GetHandle());
     mSwapchain.Initialize(mDevice.GetHandle(), mDevice.GetPhysicalDevice(),
                           mSurface, mWindow.GetHandle(), mDevice.GetQueueFamilyIndices());
-    mSync.Initialize(mDevice.GetHandle(), FRAMES_IN_FLIGHT);
+    mSync.Initialize(mDevice.GetHandle(), FRAMES_IN_FLIGHT, mSwapchain.GetImageCount());
     mCommandBuffers.Initialize(mDevice.GetHandle(), mDevice.GetQueueFamilyIndices().graphicsFamily,
                                mSwapchain.GetImageCount());
     mImageFences.resize(mSwapchain.GetImageCount(), VK_NULL_HANDLE);
@@ -651,7 +651,7 @@ void Application::DrawFrame() {
 
     VkSemaphore          waitSems[]   = { acquireSem };
     VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
-    VkSemaphore          signalSems[] = { mSync.GetRenderFinishedSemaphore(mFrameIndex) };
+    VkSemaphore          signalSems[] = { mSync.GetRenderFinishedSemaphore(imageIndex) };
     VkCommandBuffer      cmdBuf       = mCommandBuffers.Get(imageIndex);
 
     VkSubmitInfo submitInfo{};

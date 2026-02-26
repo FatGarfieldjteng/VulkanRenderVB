@@ -1,7 +1,7 @@
 #include "RHI/VulkanSync.h"
 #include "Core/Logger.h"
 
-void VulkanSync::Initialize(VkDevice device, uint32_t framesInFlight) {
+void VulkanSync::Initialize(VkDevice device, uint32_t framesInFlight, uint32_t swapchainImageCount) {
     VkSemaphoreCreateInfo semInfo{};
     semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 
@@ -10,16 +10,19 @@ void VulkanSync::Initialize(VkDevice device, uint32_t framesInFlight) {
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
     mImageAvailableSemaphores.resize(framesInFlight);
-    mRenderFinishedSemaphores.resize(framesInFlight);
     mFences.resize(framesInFlight);
-
     for (uint32_t i = 0; i < framesInFlight; i++) {
         VK_CHECK(vkCreateSemaphore(device, &semInfo, nullptr, &mImageAvailableSemaphores[i]));
-        VK_CHECK(vkCreateSemaphore(device, &semInfo, nullptr, &mRenderFinishedSemaphores[i]));
         VK_CHECK(vkCreateFence(device, &fenceInfo, nullptr, &mFences[i]));
     }
 
-    LOG_INFO("Sync objects created ({} frames-in-flight)", framesInFlight);
+    mRenderFinishedSemaphores.resize(swapchainImageCount);
+    for (uint32_t i = 0; i < swapchainImageCount; i++) {
+        VK_CHECK(vkCreateSemaphore(device, &semInfo, nullptr, &mRenderFinishedSemaphores[i]));
+    }
+
+    LOG_INFO("Sync objects created ({} frames-in-flight, {} render-finished semaphores)",
+             framesInFlight, swapchainImageCount);
 }
 
 void VulkanSync::Shutdown(VkDevice device) {

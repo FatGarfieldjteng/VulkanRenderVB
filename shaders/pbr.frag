@@ -1,22 +1,23 @@
 #version 450
 #extension GL_EXT_nonuniform_qualifier : enable
 
-layout(location = 0) in vec3 fragWorldPos;
-layout(location = 1) in vec3 fragNormal;
-layout(location = 2) in vec2 fragTexCoord;
+layout(location = 0) in vec3  fragWorldPos;
+layout(location = 1) in vec3  fragNormal;
+layout(location = 2) in vec2  fragTexCoord;
 layout(location = 3) in float fragViewDepth;
+layout(location = 4) in vec4  fragTangent;
 
 layout(set = 0, binding = 0) uniform sampler2D textures[];
 
-layout(set = 1, binding = 0) uniform FrameUBO {
-    mat4 view;
-    mat4 projection;
-    mat4 viewProjection;
-    vec4 cameraPos;
-    vec4 sunDirection;
-    vec4 sunColor;       // w = intensity
-    mat4 cascadeViewProj[4];
-    vec4 cascadeSplits;
+layout(std140, set = 1, binding = 0) uniform FrameUBO {
+    mat4  view;
+    mat4  projection;
+    mat4  viewProjection;
+    vec4  cameraPos;
+    vec4  sunDirection;
+    vec4  sunColor;
+    mat4  cascadeViewProj[4];
+    vec4  cascadeSplits;
 } frame;
 
 struct MaterialParams {
@@ -36,6 +37,9 @@ layout(std430, set = 1, binding = 1) readonly buffer MaterialSSBO {
 };
 
 layout(set = 1, binding = 2) uniform sampler2DArrayShadow shadowMap;
+layout(set = 1, binding = 3) uniform samplerCube irradianceMap;
+layout(set = 1, binding = 4) uniform samplerCube prefilterMap;
+layout(set = 1, binding = 5) uniform sampler2D   brdfLUT;
 
 layout(push_constant) uniform PushConstants {
     mat4 model;
@@ -45,6 +49,9 @@ layout(push_constant) uniform PushConstants {
 layout(location = 0) out vec4 outColor;
 
 const float PI = 3.14159265359;
+const float MAX_PREFILTER_LOD = 4.0;
+
+// ---- PBR functions ----
 
 float DistributionGGX(vec3 N, vec3 H, float roughness) {
     float a  = roughness * roughness;
@@ -71,10 +78,15 @@ vec3 FresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
+vec3 FresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
+    return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// ---- Shadow functions ----
+
 float SampleShadowPCF(vec3 worldPos, uint cascade) {
     vec4 lightSpace = frame.cascadeViewProj[cascade] * vec4(worldPos, 1.0);
     vec3 projCoords = lightSpace.xyz / lightSpace.w;
-
     vec2 shadowUV = projCoords.xy * 0.5 + 0.5;
     float currentDepth = projCoords.z;
 
@@ -101,6 +113,26 @@ float ComputeShadow(vec3 worldPos) {
     return SampleShadowPCF(worldPos, cascade);
 }
 
+// ---- Normal mapping ----
+
+vec3 ComputeNormal(MaterialParams mat) {
+    vec3 Ng = normalize(fragNormal);
+    vec3 T  = fragTangent.xyz;
+
+    if (length(T) < 0.01)
+        return Ng;
+
+    T = normalize(T - dot(T, Ng) * Ng);
+    vec3 B = cross(Ng, T) * fragTangent.w;
+    mat3 TBN = mat3(T, B, Ng);
+
+    vec3 normalSample = texture(textures[nonuniformEXT(mat.normalTexIdx)], fragTexCoord).rgb;
+    normalSample = normalSample * 2.0 - 1.0;
+    return normalize(TBN * normalSample);
+}
+
+// ---- Main ----
+
 void main() {
     MaterialParams mat = materials[pc.materialIndex];
 
@@ -113,12 +145,13 @@ void main() {
 
     float ao = texture(textures[nonuniformEXT(mat.aoTexIdx)], fragTexCoord).r;
 
-    vec3 N = normalize(fragNormal);
+    vec3 N = ComputeNormal(mat);
     vec3 V = normalize(frame.cameraPos.xyz - fragWorldPos);
 
     vec3 albedo = baseColor.rgb;
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
 
+    // ---- Direct sunlight (Cook-Torrance) ----
     vec3 L = normalize(-frame.sunDirection.xyz);
     vec3 H = normalize(V + L);
     float NdotL = max(dot(N, L), 0.0);
@@ -135,15 +168,28 @@ void main() {
     vec3 radiance = frame.sunColor.rgb * frame.sunColor.w;
     vec3 Lo = (diffuse + specular) * radiance * NdotL * shadow;
 
-    float hemiFactor = dot(N, vec3(0, 1, 0)) * 0.5 + 0.5;
-    vec3 skyColor = mix(vec3(0.05, 0.05, 0.08), vec3(0.15, 0.2, 0.35), hemiFactor);
-    vec3 ambient = skyColor * albedo * ao;
+    // ---- IBL ambient ----
+    float NdotV = max(dot(N, V), 0.0);
+    vec3 F_ibl = FresnelSchlickRoughness(NdotV, F0, roughness);
+    vec3 kD_ibl = (1.0 - F_ibl) * (1.0 - metallic);
 
+    vec3 irradiance  = texture(irradianceMap, N).rgb;
+    vec3 diffuseIBL  = kD_ibl * irradiance * albedo;
+
+    vec3 R = reflect(-V, N);
+    vec3 prefilteredColor = textureLod(prefilterMap, R, roughness * MAX_PREFILTER_LOD).rgb;
+    vec2 brdf = texture(brdfLUT, vec2(NdotV, roughness)).rg;
+    vec3 specularIBL = prefilteredColor * (F_ibl * brdf.x + brdf.y);
+
+    vec3 ambient = (diffuseIBL + specularIBL) * ao;
+
+    // ---- Emissive ----
     vec3 emissive = texture(textures[nonuniformEXT(mat.emissiveTexIdx)], fragTexCoord).rgb;
 
+    // ---- Final ----
     vec3 color = ambient + Lo + emissive;
 
-    // Reinhard tonemapping (no manual gamma -- sRGB framebuffer handles it)
+    // Reinhard tonemapping (sRGB swapchain handles gamma)
     color = color / (color + vec3(1.0));
 
     outColor = vec4(color, baseColor.a);

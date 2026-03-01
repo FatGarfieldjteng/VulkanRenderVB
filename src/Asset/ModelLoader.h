@@ -9,6 +9,7 @@ struct MeshVertex {
     glm::vec3 position;
     glm::vec3 normal;
     glm::vec2 texCoord;
+    glm::vec4 tangent{0.0f}; // xyz = tangent, w = handedness (+1 or -1)
 };
 
 struct MeshData {
@@ -44,12 +45,8 @@ struct ModelData {
 
 class ModelLoader {
 public:
-    /// Load a glTF 2.0 file (.gltf or .glb).
     static bool LoadGLTF(const std::string& path, ModelData& outModel);
-
-    /// Generate a textured cube with a checkerboard pattern.
     static void GenerateProceduralCube(ModelData& outModel);
-
-    /// Generate a ground plane mesh.
     static void GenerateGroundPlane(MeshData& outMesh, float halfSize = 20.0f);
+    static void ComputeTangents(MeshData& mesh);
 };

@@ -1,5 +1,5 @@
 #include "Scene/Camera.h"
-#include "Core/Window.h"
+#include "Core/InputManager.h"
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -8,116 +8,113 @@
 #include <algorithm>
 #include <cmath>
 
-void Camera::Init(glm::vec3 position, glm::vec3 target, float fovDeg,
+void Camera::Init(glm::vec3 position, glm::vec3 focusPoint, float fovDeg,
                   float nearPlane, float farPlane) {
-    mPosition = position;
-    mTarget   = target;
-    mFovDeg   = fovDeg;
-    mNear     = nearPlane;
-    mFar      = farPlane;
+    mPosition   = position;
+    mFocusPoint = focusPoint;
+    mFovDeg     = fovDeg;
+    mNear       = nearPlane;
+    mFar        = farPlane;
 
-    glm::vec3 dir = glm::normalize(target - position);
+    mFocusDistance = glm::length(focusPoint - position);
+    if (mFocusDistance < 0.1f) mFocusDistance = 5.0f;
+
+    glm::vec3 dir = glm::normalize(focusPoint - position);
     mYaw   = glm::degrees(std::atan2(dir.z, dir.x));
-    mPitch = glm::degrees(std::asin(dir.y));
-
-    mOrbitDistance = glm::length(target - position);
-    mOrbitYaw     = -mYaw;
-    mOrbitPitch   = -mPitch;
+    mPitch = glm::degrees(std::asin(std::clamp(dir.y, -1.0f, 1.0f)));
 }
 
-void Camera::Update(const Window& window, float dt) {
-    if (window.IsKeyDown(GLFW_KEY_TAB)) {
-        // handled by key callback debounce; but for simplicity toggle check each frame
+void Camera::Update(const InputManager& input, float dt) {
+    float dx = input.GetMouseDX();
+    float dy = input.GetMouseDY();
+
+    bool rightBtn  = input.IsMouseButtonDown(GLFW_MOUSE_BUTTON_RIGHT);
+    bool leftBtn   = input.IsMouseButtonDown(GLFW_MOUSE_BUTTON_LEFT);
+    bool middleBtn = input.IsMouseButtonDown(GLFW_MOUSE_BUTTON_MIDDLE);
+
+    // --- Right-click: FPS fly ---
+    if (rightBtn) {
+        mYaw   += dx * mMouseSensitivity;
+        mPitch -= dy * mMouseSensitivity;
+        mPitch  = std::clamp(mPitch, -89.0f, 89.0f);
+
+        float speed = mMoveSpeed * dt;
+        if (input.IsActive(InputManager::Action::SpeedBoost))
+            speed *= 3.0f;
+
+        glm::vec3 front = GetFront();
+        glm::vec3 right = GetRight();
+        glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
+
+        if (input.IsActive(InputManager::Action::MoveForward))  mPosition += front   * speed;
+        if (input.IsActive(InputManager::Action::MoveBackward)) mPosition -= front   * speed;
+        if (input.IsActive(InputManager::Action::MoveLeft))     mPosition -= right   * speed;
+        if (input.IsActive(InputManager::Action::MoveRight))    mPosition += right   * speed;
+        if (input.IsActive(InputManager::Action::MoveUp))       mPosition += worldUp * speed;
+        if (input.IsActive(InputManager::Action::MoveDown))     mPosition -= worldUp * speed;
+
+        RecalcFocusFromCamera();
+    }
+    // --- Left-click: Orbit ---
+    else if (leftBtn) {
+        mYaw   += dx * mMouseSensitivity;
+        mPitch -= dy * mMouseSensitivity;
+        mPitch  = std::clamp(mPitch, -89.0f, 89.0f);
+
+        RecalcCameraFromFocus();
+    }
+    // --- Middle-click: Pan ---
+    else if (middleBtn) {
+        float panSpeed = mFocusDistance * 0.002f;
+
+        glm::vec3 right = GetRight();
+        glm::vec3 up    = GetUp();
+
+        glm::vec3 offset = -right * dx * panSpeed + up * dy * panSpeed;
+        mFocusPoint += offset;
+        mPosition   += offset;
     }
 
-    if (mMode == CameraMode::FPS)
-        UpdateFPS(window, dt);
-    else
-        UpdateOrbit(window, dt);
+    // --- Scroll: Dolly ---
+    float scroll = input.GetScrollDY();
+    if (std::abs(scroll) > 0.001f) {
+        glm::vec3 front = GetFront();
+        float dolly = scroll * mFocusDistance * 0.1f;
+        mPosition      += front * dolly;
+        mFocusDistance  -= dolly;
+        mFocusDistance   = std::max(mFocusDistance, 0.1f);
+        mFocusPoint      = mPosition + front * mFocusDistance;
+    }
 }
 
-void Camera::UpdateFPS(const Window& window, float dt) {
-    if (!window.IsCursorCaptured()) return;
-
-    float dx = window.GetMouseDX() * mMouseSensitivity;
-    float dy = window.GetMouseDY() * mMouseSensitivity;
-
-    mYaw   += dx;
-    mPitch -= dy;
-    mPitch = std::clamp(mPitch, -89.0f, 89.0f);
-
+glm::vec3 Camera::GetFront() const {
     float yawRad   = glm::radians(mYaw);
     float pitchRad = glm::radians(mPitch);
-
-    glm::vec3 front;
-    front.x = std::cos(pitchRad) * std::cos(yawRad);
-    front.y = std::sin(pitchRad);
-    front.z = std::cos(pitchRad) * std::sin(yawRad);
-    front = glm::normalize(front);
-
-    glm::vec3 right = glm::normalize(glm::cross(front, glm::vec3(0, 1, 0)));
-    glm::vec3 up    = glm::normalize(glm::cross(right, front));
-
-    float speed = mMoveSpeed * dt;
-    if (window.IsKeyDown(GLFW_KEY_LEFT_SHIFT)) speed *= 3.0f;
-
-    if (window.IsKeyDown(GLFW_KEY_W)) mPosition += front * speed;
-    if (window.IsKeyDown(GLFW_KEY_S)) mPosition -= front * speed;
-    if (window.IsKeyDown(GLFW_KEY_A)) mPosition -= right * speed;
-    if (window.IsKeyDown(GLFW_KEY_D)) mPosition += right * speed;
-    if (window.IsKeyDown(GLFW_KEY_E)) mPosition += up * speed;
-    if (window.IsKeyDown(GLFW_KEY_Q)) mPosition -= up * speed;
+    return glm::normalize(glm::vec3(
+        std::cos(pitchRad) * std::cos(yawRad),
+        std::sin(pitchRad),
+        std::cos(pitchRad) * std::sin(yawRad)
+    ));
 }
 
-void Camera::UpdateOrbit(const Window& window, float dt) {
-    (void)dt;
+glm::vec3 Camera::GetRight() const {
+    return glm::normalize(glm::cross(GetFront(), glm::vec3(0.0f, 1.0f, 0.0f)));
+}
 
-    if (window.IsMouseButtonDown(GLFW_MOUSE_BUTTON_LEFT)) {
-        mOrbitYaw   += window.GetMouseDX() * mMouseSensitivity;
-        mOrbitPitch += window.GetMouseDY() * mMouseSensitivity;
-        mOrbitPitch = std::clamp(mOrbitPitch, -89.0f, 89.0f);
-    }
+glm::vec3 Camera::GetUp() const {
+    return glm::normalize(glm::cross(GetRight(), GetFront()));
+}
 
-    if (window.IsMouseButtonDown(GLFW_MOUSE_BUTTON_MIDDLE)) {
-        float panSpeed = mOrbitDistance * 0.002f;
-        float yawRad   = glm::radians(mOrbitYaw);
-        float pitchRad = glm::radians(mOrbitPitch);
+void Camera::RecalcFocusFromCamera() {
+    mFocusPoint = mPosition + GetFront() * mFocusDistance;
+}
 
-        glm::vec3 front;
-        front.x = std::cos(pitchRad) * std::sin(yawRad);
-        front.y = -std::sin(pitchRad);
-        front.z = std::cos(pitchRad) * std::cos(yawRad);
-
-        glm::vec3 right = glm::normalize(glm::cross(front, glm::vec3(0, 1, 0)));
-        glm::vec3 up    = glm::normalize(glm::cross(right, front));
-
-        mTarget -= right * window.GetMouseDX() * panSpeed;
-        mTarget += up    * window.GetMouseDY() * panSpeed;
-    }
-
-    mOrbitDistance -= window.GetScrollDY() * mOrbitDistance * 0.1f;
-    mOrbitDistance = std::clamp(mOrbitDistance, 0.5f, 200.0f);
-
-    float yawRad   = glm::radians(mOrbitYaw);
-    float pitchRad = glm::radians(mOrbitPitch);
-
-    mPosition.x = mTarget.x + mOrbitDistance * std::cos(pitchRad) * std::sin(yawRad);
-    mPosition.y = mTarget.y + mOrbitDistance * std::sin(pitchRad);
-    mPosition.z = mTarget.z + mOrbitDistance * std::cos(pitchRad) * std::cos(yawRad);
+void Camera::RecalcCameraFromFocus() {
+    mPosition = mFocusPoint - GetFront() * mFocusDistance;
 }
 
 glm::mat4 Camera::GetViewMatrix() const {
-    if (mMode == CameraMode::Orbit) {
-        return glm::lookAt(mPosition, mTarget, glm::vec3(0, 1, 0));
-    }
-
-    float yawRad   = glm::radians(mYaw);
-    float pitchRad = glm::radians(mPitch);
-    glm::vec3 front;
-    front.x = std::cos(pitchRad) * std::cos(yawRad);
-    front.y = std::sin(pitchRad);
-    front.z = std::cos(pitchRad) * std::sin(yawRad);
-    return glm::lookAt(mPosition, mPosition + glm::normalize(front), glm::vec3(0, 1, 0));
+    return glm::lookAt(mPosition, mPosition + GetFront(), glm::vec3(0.0f, 1.0f, 0.0f));
 }
 
 glm::mat4 Camera::GetProjectionMatrix(float aspect) const {

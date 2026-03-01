@@ -1,6 +1,9 @@
 #include "Core/Application.h"
 #include "Core/Logger.h"
 #include "RHI/VulkanUtils.h"
+#include "RenderGraph/Passes/ShadowPass.h"
+#include "RenderGraph/Passes/ForwardPass.h"
+#include "RenderGraph/Passes/PresentPass.h"
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -11,11 +14,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <array>
-
-struct PBRPushConstants {
-    glm::mat4 model;
-    uint32_t  materialIndex;
-};
+#include <memory>
 
 // =======================================================================
 void Application::Run() {
@@ -34,6 +33,7 @@ void Application::InitWindow() {
     mWindow.SetResizeCallback([this](uint32_t, uint32_t) {
         mFramebufferResized = true;
     });
+    mInput.Initialize();
 }
 
 void Application::InitVulkan() {
@@ -57,20 +57,26 @@ void Application::InitVulkan() {
 
     mCSM.Initialize(mMemory.GetAllocator(), mDevice.GetHandle());
 
+    mIBL.Initialize(mMemory.GetAllocator(), mDevice.GetHandle(), mTransfer, mPipelines.GetCache());
+    mIBL.Process();
+
+    mImageCache.Initialize(mDevice.GetHandle(), mMemory.GetAllocator());
+    mRenderGraph.Initialize(mDevice.GetHandle(), &mImageCache);
+
     CreateDefaultTextures();
     LoadScene();
     CreateDepthBuffer();
     CreateFrameDescriptors();
     CreatePipelines();
 
-    mCamera.Init(glm::vec3(0, 3, 8), glm::vec3(0, 0, 0), 45.0f, 0.1f, 150.0f);
+    mCamera.Init(glm::vec3(0, 200, 0), glm::vec3(0, 200, -100), 45.0f, 1.0f, 5000.0f);
     mLastFrameTime = glfwGetTime();
 
-    LOG_INFO("Vulkan initialization complete (Phase 3)");
+    LOG_INFO("Vulkan initialization complete (Phase 5 — Render Graph)");
 }
 
 // =======================================================================
-// Default textures (1x1 white + black for material fallbacks)
+// Default textures
 // =======================================================================
 void Application::CreateDefaultTextures() {
     auto device    = mDevice.GetHandle();
@@ -90,18 +96,36 @@ void Application::CreateDefaultTextures() {
     mDescriptors.UpdateTexture(device, mBlackTexDescIdx, mBlackTexture.GetView(),
                                mDescriptors.GetDefaultSampler());
 
-    LOG_INFO("Default textures created (white={}, black={})", mWhiteTexDescIdx, mBlackTexDescIdx);
+    uint8_t normalPixels[4] = {128, 128, 255, 255};
+    mDefaultNormalTexture.CreateTexture2D(allocator, device, mTransfer, 1, 1,
+                                          VK_FORMAT_R8G8B8A8_UNORM, normalPixels);
+    mDefaultNormalDescIdx = mDescriptors.AllocateTextureIndex();
+    mDescriptors.UpdateTexture(device, mDefaultNormalDescIdx, mDefaultNormalTexture.GetView(),
+                               mDescriptors.GetDefaultSampler());
+
+    LOG_INFO("Default textures created (white={}, black={}, normal={})",
+             mWhiteTexDescIdx, mBlackTexDescIdx, mDefaultNormalDescIdx);
 }
 
 // =======================================================================
-// Scene loading
+// Scene loading (ECS-based)
 // =======================================================================
 void Application::LoadScene() {
     auto device    = mDevice.GetHandle();
     auto allocator = mMemory.GetAllocator();
 
+    mSunEntity = mRegistry.CreateEntity();
+    mRegistry.AddTransform(mSunEntity);
+    auto& sunLight = mRegistry.AddLight(mSunEntity);
+    sunLight.direction = glm::normalize(glm::vec3(-0.4f, -0.8f, -0.3f));
+    sunLight.color     = glm::vec3(1.0f, 0.95f, 0.85f);
+    sunLight.intensity = 3.5f;
+
     bool loaded = false;
     const char* modelPaths[] = {
+        "assets/Sponza/Sponza.gltf",
+        "assets/Sponza.glb",
+        "assets/Bistro/Bistro.gltf",
         "assets/DamagedHelmet.glb",
         "assets/DamagedHelmet/DamagedHelmet.gltf",
         "assets/model.glb",
@@ -109,12 +133,14 @@ void Application::LoadScene() {
     for (const char* p : modelPaths) {
         if (std::filesystem::exists(p)) {
             loaded = ModelLoader::LoadGLTF(p, mModelData);
-            if (loaded) break;
+            if (loaded) {
+                LOG_INFO("Loaded glTF model: {}", p);
+                break;
+            }
         }
     }
 
     if (loaded) {
-        // Determine sRGB vs UNORM per texture based on material usage
         std::vector<bool> isLinear(mModelData.textures.size(), false);
         for (const auto& mat : mModelData.materials) {
             if (mat.metallicRoughnessTextureIndex >= 0)
@@ -128,15 +154,12 @@ void Application::LoadScene() {
         for (size_t i = 0; i < mModelData.textures.size(); i++) {
             const auto& texData = mModelData.textures[i];
             VkFormat fmt = isLinear[i] ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R8G8B8A8_SRGB;
-
             VulkanImage gpuTex;
             gpuTex.CreateTexture2D(allocator, device, mTransfer,
                                    texData.width, texData.height, fmt, texData.pixels.data());
-
             uint32_t descIdx = mDescriptors.AllocateTextureIndex();
             mDescriptors.UpdateTexture(device, descIdx, gpuTex.GetView(),
                                        mDescriptors.GetDefaultSampler());
-
             mGPUTextures.push_back(std::move(gpuTex));
             mTextureDescriptorIndices.push_back(descIdx);
         }
@@ -161,27 +184,27 @@ void Application::LoadScene() {
 
         for (const auto& mat : mModelData.materials) {
             GPUMaterialData g{};
-            g.baseColorFactor        = mat.baseColorFactor;
-            g.metallicFactor         = mat.metallicFactor;
-            g.roughnessFactor        = mat.roughnessFactor;
-            g.baseColorTexIdx        = resolveIdx(mat.baseColorTextureIndex, mWhiteTexDescIdx);
-            g.normalTexIdx           = resolveIdx(mat.normalTextureIndex, mWhiteTexDescIdx);
+            g.baseColorFactor         = mat.baseColorFactor;
+            g.metallicFactor          = mat.metallicFactor;
+            g.roughnessFactor         = mat.roughnessFactor;
+            g.baseColorTexIdx         = resolveIdx(mat.baseColorTextureIndex, mWhiteTexDescIdx);
+            g.normalTexIdx            = resolveIdx(mat.normalTextureIndex, mDefaultNormalDescIdx);
             g.metallicRoughnessTexIdx = resolveIdx(mat.metallicRoughnessTextureIndex, mWhiteTexDescIdx);
-            g.aoTexIdx               = resolveIdx(mat.occlusionTextureIndex, mWhiteTexDescIdx);
-            g.emissiveTexIdx         = resolveIdx(mat.emissiveTextureIndex, mBlackTexDescIdx);
+            g.aoTexIdx                = resolveIdx(mat.occlusionTextureIndex, mWhiteTexDescIdx);
+            g.emissiveTexIdx          = resolveIdx(mat.emissiveTextureIndex, mBlackTexDescIdx);
             mGPUMaterials.push_back(g);
         }
 
         for (size_t i = 0; i < mModelData.meshes.size(); i++) {
-            auto& obj = mScene.AddObject();
-            obj.meshIndex     = static_cast<int>(i);
-            obj.materialIndex = std::max(0, mModelData.meshes[i].materialIndex);
+            Entity e = mRegistry.CreateEntity();
+            mRegistry.AddTransform(e);
+            mRegistry.AddMesh(e).meshIndex = static_cast<int>(i);
+            mRegistry.AddMaterial(e).materialIndex = std::max(0, mModelData.meshes[i].materialIndex);
         }
 
     } else {
         LOG_INFO("No glTF model found, generating procedural scene");
 
-        // Checkerboard texture for the ground
         constexpr uint32_t texW = 512, texH = 512, tileSize = 32;
         std::vector<uint8_t> checkerPixels(texW * texH * 4);
         for (uint32_t y = 0; y < texH; y++) {
@@ -204,7 +227,6 @@ void Application::LoadScene() {
         mGPUTextures.push_back(std::move(checkerImg));
         mTextureDescriptorIndices.push_back(checkerDescIdx);
 
-        // Mesh 0: ground plane
         {
             MeshData groundMesh;
             ModelLoader::GenerateGroundPlane(groundMesh, 20.0f);
@@ -218,8 +240,6 @@ void Application::LoadScene() {
                 groundMesh.indices.data(), groundMesh.indices.size() * sizeof(uint32_t));
             mGPUMeshes.push_back(std::move(gpu));
         }
-
-        // Mesh 1: cube
         {
             ModelData cubeData;
             ModelLoader::GenerateProceduralCube(cubeData);
@@ -235,47 +255,43 @@ void Application::LoadScene() {
             mGPUMeshes.push_back(std::move(gpu));
         }
 
-        // Material helper
         auto pushMat = [&](glm::vec3 color, float metallic, float roughness, uint32_t baseTexIdx) {
             GPUMaterialData m{};
             m.baseColorFactor         = glm::vec4(color, 1.0f);
             m.metallicFactor          = metallic;
             m.roughnessFactor         = roughness;
             m.baseColorTexIdx         = baseTexIdx;
-            m.normalTexIdx            = mWhiteTexDescIdx;
+            m.normalTexIdx            = mDefaultNormalDescIdx;
             m.metallicRoughnessTexIdx = mWhiteTexDescIdx;
             m.aoTexIdx                = mWhiteTexDescIdx;
             m.emissiveTexIdx          = mBlackTexDescIdx;
             mGPUMaterials.push_back(m);
         };
 
-        // Mat 0: grey ground (checkerboard)
         pushMat({0.5f, 0.5f, 0.5f}, 0.0f, 0.9f, checkerDescIdx);
-        // Mat 1: red dielectric
         pushMat({0.8f, 0.15f, 0.15f}, 0.0f, 0.3f, mWhiteTexDescIdx);
-        // Mat 2: green metallic
         pushMat({0.1f, 0.7f, 0.1f}, 0.9f, 0.15f, mWhiteTexDescIdx);
-        // Mat 3: blue rough
         pushMat({0.15f, 0.15f, 0.8f}, 0.0f, 0.7f, mWhiteTexDescIdx);
-        // Mat 4: gold
         pushMat({1.0f, 0.766f, 0.336f}, 1.0f, 0.1f, mWhiteTexDescIdx);
 
-        // Scene objects
-        { auto& o = mScene.AddObject(); o.meshIndex = 0; o.materialIndex = 0; }
-        { auto& o = mScene.AddObject(); o.meshIndex = 1; o.materialIndex = 1;
-          o.position = {-3.0f, 0.5f, 0.0f}; }
-        { auto& o = mScene.AddObject(); o.meshIndex = 1; o.materialIndex = 2;
-          o.position = {-1.0f, 0.5f, -1.0f}; }
-        { auto& o = mScene.AddObject(); o.meshIndex = 1; o.materialIndex = 3;
-          o.position = {1.0f, 0.5f, 0.0f}; }
-        { auto& o = mScene.AddObject(); o.meshIndex = 1; o.materialIndex = 4;
-          o.position = {3.0f, 0.5f, 1.0f}; }
+        auto makeObj = [&](int mesh, int mat, glm::vec3 pos) {
+            Entity e = mRegistry.CreateEntity();
+            auto& tc = mRegistry.AddTransform(e);
+            tc.localPosition = pos;
+            mRegistry.AddMesh(e).meshIndex = mesh;
+            mRegistry.AddMaterial(e).materialIndex = mat;
+        };
+        makeObj(0, 0, {0, 0, 0});
+        makeObj(1, 1, {-3.0f, 0.5f, 0.0f});
+        makeObj(1, 2, {-1.0f, 0.5f, -1.0f});
+        makeObj(1, 3, {1.0f, 0.5f, 0.0f});
+        makeObj(1, 4, {3.0f, 0.5f, 1.0f});
     }
 
     if (mGPUMaterials.empty()) {
         GPUMaterialData def{};
         def.baseColorTexIdx         = mWhiteTexDescIdx;
-        def.normalTexIdx            = mWhiteTexDescIdx;
+        def.normalTexIdx            = mDefaultNormalDescIdx;
         def.metallicRoughnessTexIdx = mWhiteTexDescIdx;
         def.aoTexIdx                = mWhiteTexDescIdx;
         def.emissiveTexIdx          = mBlackTexDescIdx;
@@ -286,9 +302,9 @@ void Application::LoadScene() {
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         mGPUMaterials.data(), mGPUMaterials.size() * sizeof(GPUMaterialData));
 
-    LOG_INFO("Scene loaded: {} meshes, {} textures, {} materials, {} objects",
+    LOG_INFO("Scene loaded: {} meshes, {} textures, {} materials, {} entities",
              mGPUMeshes.size(), mGPUTextures.size(), mGPUMaterials.size(),
-             mScene.GetObjects().size());
+             mRegistry.EntityCount());
 }
 
 // =======================================================================
@@ -301,38 +317,36 @@ void Application::CreateDepthBuffer() {
 }
 
 // =======================================================================
-// Frame descriptors (set 1: UBO + material SSBO + shadow map)
+// Frame descriptors (set 1: 6 bindings -- UBO + SSBO + shadow + IBL)
 // =======================================================================
 void Application::CreateFrameDescriptors() {
     auto device     = mDevice.GetHandle();
     uint32_t frames = FRAMES_IN_FLIGHT;
 
-    VkDescriptorSetLayoutBinding bindings[3]{};
-    bindings[0].binding         = 0;
-    bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    bindings[0].descriptorCount = 1;
-    bindings[0].stageFlags      = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-
-    bindings[1].binding         = 1;
-    bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    bindings[1].descriptorCount = 1;
-    bindings[1].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-    bindings[2].binding         = 2;
-    bindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    bindings[2].descriptorCount = 1;
-    bindings[2].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutBinding bindings[6]{};
+    bindings[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                   VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    bindings[2] = {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                   VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    bindings[3] = {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                   VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    bindings[4] = {4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                   VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    bindings[5] = {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                   VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
 
     VkDescriptorSetLayoutCreateInfo layoutCI{};
     layoutCI.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutCI.bindingCount = 3;
+    layoutCI.bindingCount = 6;
     layoutCI.pBindings    = bindings;
     VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutCI, nullptr, &mFrameSetLayout));
 
     VkDescriptorPoolSize poolSizes[] = {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         frames },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         frames },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, frames },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, frames * 4 },
     };
     VkDescriptorPoolCreateInfo poolCI{};
     poolCI.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -356,47 +370,42 @@ void Application::CreateFrameDescriptors() {
                                         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                                         sizeof(FrameData));
 
-        VkDescriptorBufferInfo uboInfo{};
-        uboInfo.buffer = mFrameUBOs[i].GetHandle();
-        uboInfo.offset = 0;
-        uboInfo.range  = sizeof(FrameData);
+        VkDescriptorBufferInfo uboInfo{mFrameUBOs[i].GetHandle(), 0, sizeof(FrameData)};
+        VkDescriptorBufferInfo matInfo{mMaterialSSBO.GetHandle(), 0, mMaterialSSBO.GetSize()};
 
-        VkDescriptorBufferInfo ssboInfo{};
-        ssboInfo.buffer = mMaterialSSBO.GetHandle();
-        ssboInfo.offset = 0;
-        ssboInfo.range  = mMaterialSSBO.GetSize();
+        VkDescriptorImageInfo shadowInfo{mCSM.GetShadowSampler(), mCSM.GetArrayView(),
+                                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo irrInfo{mIBL.GetCubeSampler(), mIBL.GetIrradianceView(),
+                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo prefInfo{mIBL.GetCubeSampler(), mIBL.GetPrefilterView(),
+                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo brdfInfo{mIBL.GetLutSampler(), mIBL.GetBRDFLutView(),
+                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 
-        VkDescriptorImageInfo shadowInfo{};
-        shadowInfo.sampler     = mCSM.GetShadowSampler();
-        shadowInfo.imageView   = mCSM.GetArrayView();
-        shadowInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet writes[6]{};
+        for (int w = 0; w < 6; w++) {
+            writes[w].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[w].dstSet          = mFrameDescSets[i];
+            writes[w].dstBinding      = static_cast<uint32_t>(w);
+            writes[w].descriptorCount = 1;
+        }
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].pBufferInfo    = &uboInfo;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo    = &matInfo;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[2].pImageInfo     = &shadowInfo;
+        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[3].pImageInfo     = &irrInfo;
+        writes[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[4].pImageInfo     = &prefInfo;
+        writes[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[5].pImageInfo     = &brdfInfo;
 
-        VkWriteDescriptorSet writes[3]{};
-        writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet          = mFrameDescSets[i];
-        writes[0].dstBinding      = 0;
-        writes[0].descriptorCount = 1;
-        writes[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        writes[0].pBufferInfo     = &uboInfo;
-
-        writes[1].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet          = mFrameDescSets[i];
-        writes[1].dstBinding      = 1;
-        writes[1].descriptorCount = 1;
-        writes[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[1].pBufferInfo     = &ssboInfo;
-
-        writes[2].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[2].dstSet          = mFrameDescSets[i];
-        writes[2].dstBinding      = 2;
-        writes[2].descriptorCount = 1;
-        writes[2].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[2].pImageInfo      = &shadowInfo;
-
-        vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
+        vkUpdateDescriptorSets(device, 6, writes, 0, nullptr);
     }
 
-    LOG_INFO("Frame descriptors created ({} sets)", frames);
+    LOG_INFO("Frame descriptors created ({} sets, 6 bindings each)", frames);
 }
 
 // =======================================================================
@@ -405,22 +414,22 @@ void Application::CreateFrameDescriptors() {
 void Application::CreatePipelines() {
     auto device = mDevice.GetHandle();
 
-    // Shared vertex input
     VkVertexInputBindingDescription bindingDesc{};
     bindingDesc.binding   = 0;
     bindingDesc.stride    = sizeof(MeshVertex);
     bindingDesc.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
-    VkVertexInputAttributeDescription attrDescs[3]{};
-    attrDescs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(MeshVertex, position)};
-    attrDescs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(MeshVertex, normal)};
-    attrDescs[2] = {2, 0, VK_FORMAT_R32G32_SFLOAT,    offsetof(MeshVertex, texCoord)};
+    VkVertexInputAttributeDescription attrDescs[4]{};
+    attrDescs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT,    offsetof(MeshVertex, position)};
+    attrDescs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT,    offsetof(MeshVertex, normal)};
+    attrDescs[2] = {2, 0, VK_FORMAT_R32G32_SFLOAT,       offsetof(MeshVertex, texCoord)};
+    attrDescs[3] = {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshVertex, tangent)};
 
     VkPipelineVertexInputStateCreateInfo vertexInput{};
     vertexInput.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vertexInput.vertexBindingDescriptionCount   = 1;
     vertexInput.pVertexBindingDescriptions      = &bindingDesc;
-    vertexInput.vertexAttributeDescriptionCount = 3;
+    vertexInput.vertexAttributeDescriptionCount = 4;
     vertexInput.pVertexAttributeDescriptions    = attrDescs;
 
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
@@ -585,7 +594,7 @@ void Application::CreatePipelines() {
 // Main loop
 // =======================================================================
 void Application::MainLoop() {
-    LOG_INFO("Entering main loop (Phase 3)");
+    LOG_INFO("Entering main loop (Phase 5 — Render Graph)");
     while (!mWindow.ShouldClose()) {
         mWindow.PollEvents();
 
@@ -594,8 +603,11 @@ void Application::MainLoop() {
         mLastFrameTime = now;
         dt = std::min(dt, 0.1f);
 
-        mCamera.Update(mWindow, dt);
+        mInput.Update(mWindow);
+        mCamera.Update(mInput, dt);
         mWindow.ResetInputDeltas();
+
+        mRegistry.UpdateTransforms();
 
         DrawFrame();
     }
@@ -624,29 +636,34 @@ void Application::DrawFrame() {
 
     vkResetFences(device, 1, &frameFence);
 
-    // Update CSM cascades
     VkExtent2D extent = mSwapchain.GetExtent();
     float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
     glm::mat4 view = mCamera.GetViewMatrix();
     glm::mat4 proj = mCamera.GetProjectionMatrix(aspect);
-    const auto& sun = mScene.GetSun();
-    mCSM.Update(view, proj, mCamera.GetNear(), mCamera.GetFar(), sun.direction);
 
-    // Update per-frame UBO
+    const auto* sunLight = mRegistry.GetLight(mSunEntity);
+    glm::vec3 sunDir   = sunLight ? sunLight->direction : glm::normalize(glm::vec3(-0.4f, -0.8f, -0.3f));
+    glm::vec3 sunColor = sunLight ? sunLight->color     : glm::vec3(1.0f);
+    float sunIntensity  = sunLight ? sunLight->intensity : 1.0f;
+
+    mCSM.Update(view, proj, mCamera.GetNear(), mCamera.GetFar(), sunDir);
+
     FrameData fd{};
     fd.view           = view;
     fd.projection     = proj;
     fd.viewProjection = proj * view;
     fd.cameraPos      = glm::vec4(mCamera.GetPosition(), 0.0f);
-    fd.sunDirection   = glm::vec4(sun.direction, 0.0f);
-    fd.sunColor       = glm::vec4(sun.color, sun.intensity);
+    fd.sunDirection   = glm::vec4(sunDir, 0.0f);
+    fd.sunColor       = glm::vec4(sunColor, sunIntensity);
     for (uint32_t c = 0; c < CascadedShadowMap::CASCADE_COUNT; c++)
         fd.cascadeViewProj[c] = mCSM.GetViewProj(c);
     fd.cascadeSplits = mCSM.GetSplits();
     std::memcpy(mFrameUBOs[mFrameIndex].GetMappedData(), &fd, sizeof(FrameData));
 
+    mImageCache.EvictUnused(mFrameNumber, 60);
+
     auto cmd = mCommandBuffers.Begin(device, imageIndex);
-    RecordCommandBuffer(cmd, imageIndex);
+    BuildAndExecuteRenderGraph(cmd, imageIndex);
     mCommandBuffers.End(imageIndex);
 
     VkSemaphore          waitSems[]   = { acquireSem };
@@ -682,154 +699,53 @@ void Application::DrawFrame() {
     }
 
     mFrameIndex = (mFrameIndex + 1) % FRAMES_IN_FLIGHT;
+    mFrameNumber++;
 }
 
 // =======================================================================
-// Record command buffer (shadow passes + main PBR pass)
+// Build and execute render graph
 // =======================================================================
-void Application::RecordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
-    constexpr uint32_t SD = CascadedShadowMap::SHADOW_DIM;
+void Application::BuildAndExecuteRenderGraph(VkCommandBuffer cmd, uint32_t imageIndex) {
     constexpr uint32_t CC = CascadedShadowMap::CASCADE_COUNT;
+    VkExtent2D extent = mSwapchain.GetExtent();
 
-    // ===== SHADOW PASSES =====
+    mRenderGraph.BeginFrame(mFrameNumber);
 
-    TransitionImage(cmd, mCSM.GetImage(),
-        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-        VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, CC);
+    // ----- 1. Resources -----
+    auto swapRes = mRenderGraph.AddImage("Swapchain",
+        mSwapchain.GetImages()[imageIndex], mSwapchain.GetImageViews()[imageIndex],
+        VK_IMAGE_LAYOUT_UNDEFINED);
 
-    for (uint32_t c = 0; c < CC; c++) {
-        VkRenderingAttachmentInfo depthAtt{};
-        depthAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        depthAtt.imageView   = mCSM.GetLayerView(c);
-        depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        depthAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        depthAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-        depthAtt.clearValue.depthStencil = {1.0f, 0};
+    auto csmRes = mRenderGraph.AddImage("CSM",
+        mCSM.GetImage(), mCSM.GetArrayView(),
+        VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_ASPECT_DEPTH_BIT, CC);
 
-        VkRenderingInfo ri{};
-        ri.sType            = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        ri.renderArea       = {{0, 0}, {SD, SD}};
-        ri.layerCount       = 1;
-        ri.pDepthAttachment = &depthAtt;
-
-        vkCmdBeginRendering(cmd, &ri);
-
-        VkViewport vp{0, 0, static_cast<float>(SD), static_cast<float>(SD), 0.0f, 1.0f};
-        vkCmdSetViewport(cmd, 0, 1, &vp);
-        VkRect2D sc{{0, 0}, {SD, SD}};
-        vkCmdSetScissor(cmd, 0, 1, &sc);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, mShadowPipeline);
-
-        for (const auto& obj : mScene.GetObjects()) {
-            if (obj.meshIndex < 0 || obj.meshIndex >= static_cast<int>(mGPUMeshes.size())) continue;
-            glm::mat4 mvp = mCSM.GetViewProj(c) * obj.GetModelMatrix();
-            vkCmdPushConstants(cmd, mShadowPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-                               0, sizeof(glm::mat4), &mvp);
-            const auto& mesh = mGPUMeshes[obj.meshIndex];
-            VkBuffer     vb[]  = { mesh.vertexBuffer.GetHandle() };
-            VkDeviceSize off[] = { 0 };
-            vkCmdBindVertexBuffers(cmd, 0, 1, vb, off);
-            vkCmdBindIndexBuffer(cmd, mesh.indexBuffer.GetHandle(), 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
-        }
-
-        vkCmdEndRendering(cmd);
-    }
-
-    TransitionImage(cmd, mCSM.GetImage(),
-        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-        VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, CC);
-
-    // ===== MAIN PBR PASS =====
-
-    VkImage    swapImg = mSwapchain.GetImages()[imageIndex];
-    VkExtent2D extent  = mSwapchain.GetExtent();
-
-    TransitionImage(cmd, swapImg,
-        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
-        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-
-    TransitionImage(cmd, mDepthImage.GetImage(),
-        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
-        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+    auto depthRes = mRenderGraph.AddImage("Depth",
+        mDepthImage.GetImage(), mDepthImage.GetView(),
+        VK_IMAGE_LAYOUT_UNDEFINED,
         VK_IMAGE_ASPECT_DEPTH_BIT);
 
-    VkRenderingAttachmentInfo colorAtt{};
-    colorAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    colorAtt.imageView   = mSwapchain.GetImageViews()[imageIndex];
-    colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    colorAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-    colorAtt.clearValue.color = {{0.02f, 0.02f, 0.04f, 1.0f}};
+    // ----- 2. Passes (each wires its own resource access + dependencies in Setup) -----
+    auto shadowPass = mRenderGraph.AddPass(std::make_unique<ShadowPass>(ShadowPass::Desc{
+        csmRes, &mCSM, mShadowPipeline, mShadowPipelineLayout, &mRegistry, &mGPUMeshes
+    }));
 
-    VkRenderingAttachmentInfo depthAtt{};
-    depthAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    depthAtt.imageView   = mDepthImage.GetView();
-    depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    depthAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAtt.storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depthAtt.clearValue.depthStencil = {1.0f, 0};
+    auto forwardPass = mRenderGraph.AddPass(std::make_unique<ForwardPass>(ForwardPass::Desc{
+        csmRes, depthRes, swapRes, shadowPass,
+        extent, mSwapchain.GetImageViews()[imageIndex], mDepthImage.GetView(),
+        mPBRPipeline, mPBRPipelineLayout,
+        mDescriptors.GetSet(), mFrameDescSets[mFrameIndex],
+        &mRegistry, &mGPUMeshes, &mGPUMaterials
+    }));
 
-    VkRenderingInfo ri{};
-    ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    ri.renderArea           = {{0, 0}, extent};
-    ri.layerCount           = 1;
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachments    = &colorAtt;
-    ri.pDepthAttachment     = &depthAtt;
+    mRenderGraph.AddPass(std::make_unique<PresentPass>(PresentPass::Desc{
+        swapRes, forwardPass
+    }));
 
-    vkCmdBeginRendering(cmd, &ri);
-
-    VkViewport vp{0, 0, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.0f, 1.0f};
-    vkCmdSetViewport(cmd, 0, 1, &vp);
-    VkRect2D sc{{0, 0}, extent};
-    vkCmdSetScissor(cmd, 0, 1, &sc);
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, mPBRPipeline);
-
-    VkDescriptorSet bindlessSet = mDescriptors.GetSet();
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            mPBRPipelineLayout, 0, 1, &bindlessSet, 0, nullptr);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            mPBRPipelineLayout, 1, 1, &mFrameDescSets[mFrameIndex], 0, nullptr);
-
-    for (const auto& obj : mScene.GetObjects()) {
-        if (obj.meshIndex < 0 || obj.meshIndex >= static_cast<int>(mGPUMeshes.size())) continue;
-
-        int matIdx = std::clamp(obj.materialIndex, 0, static_cast<int>(mGPUMaterials.size()) - 1);
-
-        PBRPushConstants pc{};
-        pc.model         = obj.GetModelMatrix();
-        pc.materialIndex = static_cast<uint32_t>(matIdx);
-
-        vkCmdPushConstants(cmd, mPBRPipelineLayout,
-                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                           0, static_cast<uint32_t>(sizeof(glm::mat4) + sizeof(uint32_t)), &pc);
-
-        const auto& mesh = mGPUMeshes[obj.meshIndex];
-        VkBuffer     vb[]  = { mesh.vertexBuffer.GetHandle() };
-        VkDeviceSize off[] = { 0 };
-        vkCmdBindVertexBuffers(cmd, 0, 1, vb, off);
-        vkCmdBindIndexBuffer(cmd, mesh.indexBuffer.GetHandle(), 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
-    }
-
-    vkCmdEndRendering(cmd);
-
-    TransitionImage(cmd, swapImg,
-        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0,
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    // ----- 3. Compile & execute -----
+    mRenderGraph.Compile();
+    mRenderGraph.Execute(cmd);
 }
 
 // =======================================================================
@@ -878,8 +794,10 @@ void Application::CleanupVulkan() {
 
     mWhiteTexture.Destroy(allocator, device);
     mBlackTexture.Destroy(allocator, device);
+    mDefaultNormalTexture.Destroy(allocator, device);
     mDescriptors.FreeTextureIndex(mWhiteTexDescIdx);
     mDescriptors.FreeTextureIndex(mBlackTexDescIdx);
+    mDescriptors.FreeTextureIndex(mDefaultNormalDescIdx);
 
     mMaterialSSBO.Destroy(allocator);
 
@@ -892,13 +810,16 @@ void Application::CleanupVulkan() {
     mFrameDescPool  = VK_NULL_HANDLE;
     mFrameSetLayout = VK_NULL_HANDLE;
 
+    mRenderGraph.Shutdown();
+    mImageCache.Shutdown();
+    mIBL.Shutdown(allocator, device);
     mCSM.Shutdown(allocator, device);
     mDepthImage.Destroy(allocator, device);
 
-    if (mPBRPipeline)          vkDestroyPipeline(device, mPBRPipeline, nullptr);
-    if (mPBRPipelineLayout)    vkDestroyPipelineLayout(device, mPBRPipelineLayout, nullptr);
-    if (mShadowPipeline)       vkDestroyPipeline(device, mShadowPipeline, nullptr);
-    if (mShadowPipelineLayout) vkDestroyPipelineLayout(device, mShadowPipelineLayout, nullptr);
+    if (mPBRPipeline)              vkDestroyPipeline(device, mPBRPipeline, nullptr);
+    if (mPBRPipelineLayout)        vkDestroyPipelineLayout(device, mPBRPipelineLayout, nullptr);
+    if (mShadowPipeline)           vkDestroyPipeline(device, mShadowPipeline, nullptr);
+    if (mShadowPipelineLayout)     vkDestroyPipelineLayout(device, mShadowPipelineLayout, nullptr);
 
     mShaders.Shutdown();
     mPipelines.Shutdown();

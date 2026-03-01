@@ -20,6 +20,11 @@ public:
                            VkBufferUsageFlags usage,
                            VkDeviceSize size);
 
+    /// Create a device-local buffer without uploading initial data.
+    void CreateDeviceLocalEmpty(VmaAllocator allocator,
+                                VkBufferUsageFlags usage,
+                                VkDeviceSize size);
+
     void Destroy(VmaAllocator allocator);
 
     VkBuffer     GetHandle()     const { return mBuffer; }

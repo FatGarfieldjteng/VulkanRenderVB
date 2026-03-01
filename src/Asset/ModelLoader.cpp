@@ -4,6 +4,7 @@
 #include <tiny_gltf.h>
 #include <algorithm>
 #include <cstring>
+#include <cmath>
 
 static int ResolveTextureSource(const tinygltf::Model& model, int texIndex) {
     if (texIndex >= 0 && texIndex < static_cast<int>(model.textures.size()))
@@ -30,7 +31,6 @@ bool ModelLoader::LoadGLTF(const std::string& path, ModelData& outModel) {
         return false;
     }
 
-    // --- textures ---
     for (const auto& image : gltfModel.images) {
         TextureData tex;
         tex.width    = static_cast<uint32_t>(image.width);
@@ -54,7 +54,6 @@ bool ModelLoader::LoadGLTF(const std::string& path, ModelData& outModel) {
         outModel.textures.push_back(std::move(tex));
     }
 
-    // --- materials (PBR metallic-roughness) ---
     for (const auto& mat : gltfModel.materials) {
         MaterialData material;
         const auto& pbr = mat.pbrMetallicRoughness;
@@ -81,7 +80,6 @@ bool ModelLoader::LoadGLTF(const std::string& path, ModelData& outModel) {
         outModel.materials.push_back(material);
     }
 
-    // --- meshes ---
     for (const auto& mesh : gltfModel.meshes) {
         for (const auto& primitive : mesh.primitives) {
             if (primitive.mode != TINYGLTF_MODE_TRIANGLES && primitive.mode != -1)
@@ -90,10 +88,11 @@ bool ModelLoader::LoadGLTF(const std::string& path, ModelData& outModel) {
             MeshData meshData;
             meshData.materialIndex = primitive.material;
 
-            const float* posData    = nullptr;
-            const float* normalData = nullptr;
-            const float* uvData     = nullptr;
-            size_t vertexCount      = 0;
+            const float* posData     = nullptr;
+            const float* normalData  = nullptr;
+            const float* uvData      = nullptr;
+            const float* tangentData = nullptr;
+            size_t vertexCount       = 0;
 
             {
                 auto it = primitive.attributes.find("POSITION");
@@ -123,6 +122,15 @@ bool ModelLoader::LoadGLTF(const std::string& path, ModelData& outModel) {
                     uvData = reinterpret_cast<const float*>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
                 }
             }
+            {
+                auto it = primitive.attributes.find("TANGENT");
+                if (it != primitive.attributes.end()) {
+                    const auto& accessor   = gltfModel.accessors[it->second];
+                    const auto& bufferView = gltfModel.bufferViews[accessor.bufferView];
+                    const auto& buffer     = gltfModel.buffers[bufferView.buffer];
+                    tangentData = reinterpret_cast<const float*>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
+                }
+            }
 
             meshData.vertices.resize(vertexCount);
             for (size_t i = 0; i < vertexCount; i++) {
@@ -133,6 +141,9 @@ bool ModelLoader::LoadGLTF(const std::string& path, ModelData& outModel) {
                                         : glm::vec3(0.0f, 1.0f, 0.0f);
                 v.texCoord = uvData     ? glm::vec2(uvData[i * 2], uvData[i * 2 + 1])
                                         : glm::vec2(0.0f);
+                v.tangent  = tangentData ? glm::vec4(tangentData[i * 4], tangentData[i * 4 + 1],
+                                                     tangentData[i * 4 + 2], tangentData[i * 4 + 3])
+                                         : glm::vec4(0.0f);
             }
 
             if (primitive.indices >= 0) {
@@ -159,6 +170,9 @@ bool ModelLoader::LoadGLTF(const std::string& path, ModelData& outModel) {
                 }
             }
 
+            if (!tangentData)
+                ComputeTangents(meshData);
+
             outModel.meshes.push_back(std::move(meshData));
         }
     }
@@ -166,6 +180,49 @@ bool ModelLoader::LoadGLTF(const std::string& path, ModelData& outModel) {
     LOG_INFO("Loaded glTF: {} meshes, {} textures, {} materials",
              outModel.meshes.size(), outModel.textures.size(), outModel.materials.size());
     return true;
+}
+
+void ModelLoader::ComputeTangents(MeshData& mesh) {
+    auto& verts   = mesh.vertices;
+    auto& indices = mesh.indices;
+    if (verts.empty() || indices.empty()) return;
+
+    std::vector<glm::vec3> tan(verts.size(), glm::vec3(0.0f));
+    std::vector<glm::vec3> bitan(verts.size(), glm::vec3(0.0f));
+
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+        uint32_t i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
+        const auto& v0 = verts[i0];
+        const auto& v1 = verts[i1];
+        const auto& v2 = verts[i2];
+
+        glm::vec3 edge1  = v1.position - v0.position;
+        glm::vec3 edge2  = v2.position - v0.position;
+        glm::vec2 duv1   = v1.texCoord - v0.texCoord;
+        glm::vec2 duv2   = v2.texCoord - v0.texCoord;
+
+        float denom = duv1.x * duv2.y - duv2.x * duv1.y;
+        float f = std::abs(denom) > 1e-8f ? 1.0f / denom : 0.0f;
+
+        glm::vec3 t = f * (duv2.y * edge1 - duv1.y * edge2);
+        glm::vec3 b = f * (-duv2.x * edge1 + duv1.x * edge2);
+
+        tan[i0] += t;  tan[i1] += t;  tan[i2] += t;
+        bitan[i0] += b; bitan[i1] += b; bitan[i2] += b;
+    }
+
+    for (size_t i = 0; i < verts.size(); i++) {
+        glm::vec3 n = verts[i].normal;
+        glm::vec3 t = tan[i];
+        float tLen = glm::length(t);
+        if (tLen < 1e-8f) {
+            verts[i].tangent = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
+            continue;
+        }
+        t = glm::normalize(t - n * glm::dot(n, t));
+        float w = (glm::dot(glm::cross(n, t), bitan[i]) < 0.0f) ? -1.0f : 1.0f;
+        verts[i].tangent = glm::vec4(t, w);
+    }
 }
 
 void ModelLoader::GenerateProceduralCube(ModelData& outModel) {
@@ -192,7 +249,11 @@ void ModelLoader::GenerateProceduralCube(ModelData& outModel) {
     for (int f = 0; f < 6; f++) {
         uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
         for (int c = 0; c < 4; c++) {
-            mesh.vertices.push_back({positions[faces[f].v[c]], faces[f].n, uvs[c]});
+            MeshVertex v{};
+            v.position = positions[faces[f].v[c]];
+            v.normal   = faces[f].n;
+            v.texCoord = uvs[c];
+            mesh.vertices.push_back(v);
         }
         mesh.indices.push_back(base + 0);
         mesh.indices.push_back(base + 1);
@@ -201,6 +262,8 @@ void ModelLoader::GenerateProceduralCube(ModelData& outModel) {
         mesh.indices.push_back(base + 2);
         mesh.indices.push_back(base + 3);
     }
+
+    ComputeTangents(mesh);
 
     constexpr uint32_t texW = 256, texH = 256, tileSize = 32;
     TextureData tex;
@@ -233,10 +296,10 @@ void ModelLoader::GenerateProceduralCube(ModelData& outModel) {
 void ModelLoader::GenerateGroundPlane(MeshData& outMesh, float halfSize) {
     float uvScale = halfSize;
     outMesh.vertices = {
-        {{-halfSize, 0, -halfSize}, {0, 1, 0}, {0,       0}},
-        {{ halfSize, 0, -halfSize}, {0, 1, 0}, {uvScale, 0}},
-        {{ halfSize, 0,  halfSize}, {0, 1, 0}, {uvScale, uvScale}},
-        {{-halfSize, 0,  halfSize}, {0, 1, 0}, {0,       uvScale}},
+        {{-halfSize, 0, -halfSize}, {0, 1, 0}, {0,       0},       {1, 0, 0, 1}},
+        {{ halfSize, 0, -halfSize}, {0, 1, 0}, {uvScale, 0},       {1, 0, 0, 1}},
+        {{ halfSize, 0,  halfSize}, {0, 1, 0}, {uvScale, uvScale}, {1, 0, 0, 1}},
+        {{-halfSize, 0,  halfSize}, {0, 1, 0}, {0,       uvScale}, {1, 0, 0, 1}},
     };
     outMesh.indices = { 0, 2, 1, 0, 3, 2 };
 }

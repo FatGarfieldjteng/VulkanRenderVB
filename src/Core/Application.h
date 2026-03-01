@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Core/Window.h"
+#include "Core/InputManager.h"
 #include "RHI/VulkanInstance.h"
 #include "RHI/VulkanDevice.h"
 #include "RHI/VulkanSwapchain.h"
@@ -16,7 +17,11 @@
 #include "Asset/ModelLoader.h"
 #include "Scene/Camera.h"
 #include "Scene/Scene.h"
+#include "Scene/ECS.h"
 #include "Lighting/CascadedShadowMap.h"
+#include "IBL/IBLProcessor.h"
+#include "ImageCache/ImageCache.h"
+#include "RenderGraph/RenderGraph.h"
 
 #include <vector>
 
@@ -40,7 +45,7 @@ private:
     void CreatePipelines();
     void MainLoop();
     void DrawFrame();
-    void RecordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex);
+    void BuildAndExecuteRenderGraph(VkCommandBuffer cmd, uint32_t imageIndex);
     void RecreateSwapchain();
     void CleanupVulkan();
 
@@ -50,6 +55,7 @@ private:
 
     // --- core ---
     Window              mWindow;
+    InputManager        mInput;
     VulkanInstance      mVulkanInstance;
     VkSurfaceKHR        mSurface = VK_NULL_HANDLE;
     VulkanDevice        mDevice;
@@ -64,10 +70,16 @@ private:
     ShaderManager     mShaders;
     PipelineManager   mPipelines;
 
-    // --- scene ---
-    Camera            mCamera;
-    Scene             mScene;
+    // --- image cache & render graph ---
+    ImageCache  mImageCache;
+    RenderGraph mRenderGraph;
+
+    // --- scene (ECS) ---
+    Camera           mCamera;
+    Registry         mRegistry;
+    Entity           mSunEntity = INVALID_ENTITY;
     CascadedShadowMap mCSM;
+    IBLProcessor      mIBL;
 
     // --- depth ---
     VulkanImage mDepthImage;
@@ -82,8 +94,10 @@ private:
     // --- default textures ---
     VulkanImage mWhiteTexture;
     VulkanImage mBlackTexture;
-    uint32_t    mWhiteTexDescIdx = 0;
-    uint32_t    mBlackTexDescIdx = 0;
+    VulkanImage mDefaultNormalTexture;
+    uint32_t    mWhiteTexDescIdx         = 0;
+    uint32_t    mBlackTexDescIdx         = 0;
+    uint32_t    mDefaultNormalDescIdx    = 0;
 
     // --- material SSBO ---
     VulkanBuffer mMaterialSSBO;
@@ -91,20 +105,21 @@ private:
     // --- per-frame UBOs ---
     std::vector<VulkanBuffer> mFrameUBOs;
 
-    // --- frame descriptor resources (set 1) ---
+    // --- frame descriptor resources (set 1: 6 bindings) ---
     VkDescriptorSetLayout        mFrameSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool             mFrameDescPool  = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> mFrameDescSets;
 
     // --- pipelines ---
-    VkPipelineLayout mPBRPipelineLayout    = VK_NULL_HANDLE;
-    VkPipeline       mPBRPipeline          = VK_NULL_HANDLE;
-    VkPipelineLayout mShadowPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline       mShadowPipeline       = VK_NULL_HANDLE;
+    VkPipelineLayout mPBRPipelineLayout        = VK_NULL_HANDLE;
+    VkPipeline       mPBRPipeline              = VK_NULL_HANDLE;
+    VkPipelineLayout mShadowPipelineLayout     = VK_NULL_HANDLE;
+    VkPipeline       mShadowPipeline           = VK_NULL_HANDLE;
 
     // --- sync ---
     std::vector<VkFence> mImageFences;
     uint32_t mFrameIndex         = 0;
+    uint32_t mFrameNumber        = 0;
     bool     mFramebufferResized = false;
 
     // --- timing ---

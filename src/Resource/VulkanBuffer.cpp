@@ -74,6 +74,23 @@ void VulkanBuffer::CreateHostVisible(VmaAllocator allocator,
     mMappedData = info.pMappedData;
 }
 
+void VulkanBuffer::CreateDeviceLocalEmpty(VmaAllocator allocator,
+                                           VkBufferUsageFlags usage,
+                                           VkDeviceSize size) {
+    mSize = size;
+
+    VkBufferCreateInfo bufInfo{};
+    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufInfo.size  = size;
+    bufInfo.usage = usage;
+
+    VmaAllocationCreateInfo allocInfo{};
+    allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+
+    VK_CHECK(vmaCreateBuffer(allocator, &bufInfo, &allocInfo,
+                             &mBuffer, &mAllocation, nullptr));
+}
+
 void VulkanBuffer::Destroy(VmaAllocator allocator) {
     if (mBuffer != VK_NULL_HANDLE) {
         vmaDestroyBuffer(allocator, mBuffer, mAllocation);

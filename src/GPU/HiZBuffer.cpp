@@ -161,6 +161,8 @@ void HiZBuffer::CreateDescriptors(VkDevice device) {
 
 void HiZBuffer::SetSourceDepth(VkImageView depthView) {
     mSourceDepthView = depthView;
+    if (mSourceDepthView != VK_NULL_HANDLE && !mDescSets.empty())
+        UpdateSourceDescriptor(mDevice);
 }
 
 void HiZBuffer::UpdateSourceDescriptor(VkDevice device) {
@@ -196,8 +198,6 @@ void HiZBuffer::UpdateSourceDescriptor(VkDevice device) {
 
 void HiZBuffer::BuildMipChain(VkCommandBuffer cmd) const {
     if (mMipCount == 0 || mSourceDepthView == VK_NULL_HANDLE) return;
-
-    const_cast<HiZBuffer*>(this)->UpdateSourceDescriptor(mDevice);
 
     VkImageMemoryBarrier2 toGeneral{};
     toGeneral.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;

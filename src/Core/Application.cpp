@@ -12,12 +12,19 @@
 #include "GPU/IndirectRenderer.h"
 #include "GPU/HiZBuffer.h"
 #include "GPU/ComputeCulling.h"
+#include "VisualUI/DebugUI.h"
+#include "VisualUI/ImGuiPass.h"
+#include "VisualUI/GPUProfiler.h"
+#include "VisualUI/ObjectLabeling.h"
+#include "VisualUI/DebugVisualization.h"
+#include "VisualUI/PipelineStatistics.h"
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <filesystem>
@@ -29,6 +36,82 @@ void Application::Run() {
     InitWindow();
     InitVulkan();
     MainLoop();
+    CleanupVulkan();
+}
+
+void Application::RunBenchmark(uint32_t frameCount, bool gpuDriven, bool occlusionCulling) {
+    InitWindow();
+    InitVulkan();
+
+    mGPUDriven        = gpuDriven;
+    mOcclusionCulling  = occlusionCulling;
+    mShowUI            = false;
+
+    constexpr uint32_t kWarmup = 30;
+    uint32_t totalFrames = kWarmup + frameCount;
+
+    double benchStart = 0.0;
+    double totalCpu   = 0.0;
+    float  minMs = 1e9f, maxMs = 0.0f;
+
+    std::printf("=== BENCHMARK: %u frames, GPU-driven=%d, occlusion=%d ===\n",
+                frameCount, gpuDriven, occlusionCulling);
+
+    for (uint32_t i = 0; i < totalFrames && !mWindow.ShouldClose(); i++) {
+        mWindow.PollEvents();
+        double now = glfwGetTime();
+        float dt   = static_cast<float>(now - mLastFrameTime);
+        mLastFrameTime = now;
+        dt = std::min(dt, 0.1f);
+        mDeltaTime = dt;
+
+        mInput.Update(mWindow);
+        mWindow.ResetInputDeltas();
+        mRegistry.UpdateTransforms();
+
+        if (i == kWarmup) benchStart = glfwGetTime();
+
+        DrawFrame();
+
+        if (i >= kWarmup) {
+            double frameEnd = glfwGetTime();
+            float frameMs = static_cast<float>((frameEnd - now) * 1000.0);
+            totalCpu += frameMs;
+            minMs = std::min(minMs, frameMs);
+            maxMs = std::max(maxMs, frameMs);
+        }
+    }
+
+    mDevice.WaitIdle();
+
+    double benchEnd   = glfwGetTime();
+    double wallTimeS  = benchEnd - benchStart;
+    float  avgMs      = static_cast<float>(totalCpu / frameCount);
+    float  avgFps     = static_cast<float>(frameCount / wallTimeS);
+
+    const char* modeName = gpuDriven
+        ? (occlusionCulling ? "GPU-Driven + Occlusion" : "GPU-Driven (no occlusion)")
+        : "CPU Draw Calls";
+
+    std::printf("=== BENCHMARK RESULTS ===\n");
+    std::printf("  Mode:         %s\n", modeName);
+    std::printf("  Frames:       %u\n", frameCount);
+    std::printf("  Wall time:    %.2f s\n", wallTimeS);
+    std::printf("  Avg FPS:      %.1f\n", avgFps);
+    std::printf("  Avg frame:    %.3f ms\n", avgMs);
+    std::printf("  Min frame:    %.3f ms\n", minMs);
+    std::printf("  Max frame:    %.3f ms\n", maxMs);
+
+    mGPUProfiler.CollectResults(mDevice.GetHandle(), mFrameIndex);
+    const auto& gpuResults = mGPUProfiler.GetResults();
+    if (!gpuResults.empty()) {
+        std::printf("  GPU total:    %.3f ms\n", mGPUProfiler.GetTotalMs());
+        for (const auto& r : gpuResults)
+            std::printf("    %s: %.3f ms\n", r.name.c_str(), r.durationMs);
+    }
+    std::printf("=========================\n");
+    std::fflush(stdout);
+
     CleanupVulkan();
 }
 
@@ -78,6 +161,7 @@ void Application::InitVulkan() {
     CreatePipelines();
 
     InitGPUDriven();
+    InitDebugUI();
 
     mModelData = ModelData{};
 
@@ -106,8 +190,9 @@ void Application::InitVulkan() {
 
     mCamera.Init(glm::vec3(0, 1.6f, 0), glm::vec3(0, 1.6f, -1.0f), 45.0f, 0.01f, 100.0f);
     mLastFrameTime = glfwGetTime();
+    mInput.LoadBindings("input_bindings.cfg");
 
-    LOG_INFO("Vulkan initialization complete (Phase 6 - GPU-Driven Rendering)");
+    LOG_INFO("Vulkan initialization complete (Phase 7 - Debug Tools & Profiling)");
 }
 
 // =======================================================================
@@ -157,20 +242,36 @@ void Application::LoadScene() {
     sunLight.intensity = 3.5f;
 
     bool loaded = false;
-    const char* modelPaths[] = {
-        "assets/Sponza/Sponza.gltf",
-        "assets/Sponza.glb",
-        "assets/Bistro/Bistro.gltf",
-        "assets/DamagedHelmet.glb",
-        "assets/DamagedHelmet/DamagedHelmet.gltf",
-        "assets/model.glb",
-    };
-    for (const char* p : modelPaths) {
-        if (std::filesystem::exists(p)) {
-            loaded = ModelLoader::LoadGLTF(p, mModelData);
-            if (loaded) {
-                LOG_INFO("Loaded glTF model: {}", p);
-                break;
+
+    if (!mScenePathOverride.empty()) {
+        if (std::filesystem::exists(mScenePathOverride)) {
+            loaded = ModelLoader::LoadGLTF(mScenePathOverride.c_str(), mModelData);
+            if (loaded)
+                LOG_INFO("Loaded glTF model (override): {}", mScenePathOverride);
+            else
+                LOG_ERROR("Failed to load override scene: {}", mScenePathOverride);
+        } else {
+            LOG_ERROR("Override scene path does not exist: {}", mScenePathOverride);
+        }
+    }
+
+    if (!loaded) {
+        const char* modelPaths[] = {
+            "assets/Sponza/Sponza.gltf",
+            "assets/Sponza.glb",
+            "assets/Bistro/Bistro.gltf",
+            "assets/Bistro/bistro.gltf",
+            "assets/DamagedHelmet.glb",
+            "assets/DamagedHelmet/DamagedHelmet.gltf",
+            "assets/model.glb",
+        };
+        for (const char* p : modelPaths) {
+            if (std::filesystem::exists(p)) {
+                loaded = ModelLoader::LoadGLTF(p, mModelData);
+                if (loaded) {
+                    LOG_INFO("Loaded glTF model: {}", p);
+                    break;
+                }
             }
         }
     }
@@ -812,7 +913,7 @@ void Application::CreatePipelines() {
 // Main loop
 // =======================================================================
 void Application::MainLoop() {
-    LOG_INFO("Entering main loop (Phase 6 - GPU-Driven Rendering)");
+    LOG_INFO("Entering main loop (Phase 7 - Debug Tools & Profiling)");
     while (!mWindow.ShouldClose()) {
         mWindow.PollEvents();
 
@@ -820,12 +921,28 @@ void Application::MainLoop() {
         float dt   = static_cast<float>(now - mLastFrameTime);
         mLastFrameTime = now;
         dt = std::min(dt, 0.1f);
+        mDeltaTime = dt;
 
         mInput.Update(mWindow);
-        mCamera.Update(mInput, dt);
-        mWindow.ResetInputDeltas();
 
+        if (mInput.WasPressed(InputManager::Action::ToggleUI))
+            mShowUI = !mShowUI;
+
+        bool uiWantsMouse = mDebugUI.WantCaptureMouse();
+
+        if (!uiWantsMouse)
+            mCamera.Update(mInput, dt);
+
+        mWindow.ResetInputDeltas();
         mRegistry.UpdateTransforms();
+
+        SyncUIState();
+
+        if (mShowUI) {
+            mDebugUI.BeginFrame();
+            mDebugUI.BuildUI(dt, &mGPUProfiler, &mPipelineStats, &mRegistry, &mGPUMaterials);
+            mDebugUI.EndFrame();
+        }
 
         DrawFrame();
     }
@@ -880,8 +997,15 @@ void Application::DrawFrame() {
 
     mImageCache.EvictUnused(mFrameNumber, 60);
 
+    mGPUProfiler.CollectResults(device, mFrameIndex);
+    mPipelineStats.CollectResults(device, mFrameIndex);
+
     auto cmd = mCommandBuffers.Begin(device, imageIndex);
+
+    mGPUProfiler.BeginFrame(cmd, mFrameIndex);
     BuildAndExecuteRenderGraph(cmd, imageIndex);
+    mGPUProfiler.EndFrame(cmd, mFrameIndex);
+
     mCommandBuffers.End(imageIndex);
 
     VkSemaphore          waitSems[]   = { acquireSem };
@@ -1060,13 +1184,25 @@ void Application::BuildAndExecuteRenderGraph(VkCommandBuffer cmd, uint32_t image
     }
     auto forwardPassH = mRenderGraph.AddPass(std::make_unique<ForwardPass>(fwdDesc));
 
+    RenderGraph::PassHandle lastPassBeforePresent = forwardPassH;
+
+    if (mShowUI) {
+        ImGuiPass::Desc imguiDesc{};
+        imguiDesc.swapchainResource  = swapRes;
+        imguiDesc.previousPassHandle = forwardPassH;
+        imguiDesc.swapchainView      = mSwapchain.GetImageViews()[imageIndex];
+        imguiDesc.extent             = extent;
+        imguiDesc.debugUI            = &mDebugUI;
+        lastPassBeforePresent = mRenderGraph.AddPass(std::make_unique<ImGuiPass>(imguiDesc));
+    }
+
     mRenderGraph.AddPass(std::make_unique<PresentPass>(PresentPass::Desc{
-        swapRes, forwardPassH
+        swapRes, lastPassBeforePresent
     }));
 
     // ----- 3. Compile & execute -----
     mRenderGraph.Compile();
-    mRenderGraph.Execute(cmd);
+    mRenderGraph.Execute(cmd, &mGPUProfiler, mFrameIndex, &mPipelineStats);
 }
 
 // =======================================================================
@@ -1144,6 +1280,87 @@ void Application::InitGPUDriven() {
     LOG_INFO("GPU-Driven rendering initialized ({} indirect draws)", mIndirectRenderer.GetDrawCount());
 }
 
+// =======================================================================
+// Debug UI (Phase 7)
+// =======================================================================
+void Application::InitDebugUI() {
+    auto device = mDevice.GetHandle();
+
+    mDebugUI.Initialize(
+        mVulkanInstance.GetHandle(), device, mDevice.GetPhysicalDevice(),
+        mDevice.GetQueueFamilyIndices().graphicsFamily,
+        mDevice.GetGraphicsQueue(), mWindow.GetHandle(),
+        mSwapchain.GetImageFormat(), FRAMES_IN_FLIGHT);
+
+    auto& uiState = mDebugUI.GetState();
+    uiState.gpuDriven        = mGPUDriven;
+    uiState.occlusionCulling = mOcclusionCulling;
+    uiState.occluderRatio    = mOccluderRatio;
+
+    mGPUProfiler.Initialize(device, mDevice.GetPhysicalDevice(), FRAMES_IN_FLIGHT, 32);
+    mPipelineStats.Initialize(device, FRAMES_IN_FLIGHT);
+
+    mDebugVis.Initialize(device, mShaders, mPipelines,
+                         mSwapchain.GetImageFormat(),
+                         mDescriptors.GetLayout(), mFrameSetLayout);
+
+    LabelVulkanObjects();
+
+    LOG_INFO("Debug UI and profiling initialized");
+}
+
+void Application::ShutdownDebugUI() {
+    auto device = mDevice.GetHandle();
+    mDebugVis.Shutdown(device);
+    mPipelineStats.Shutdown(device);
+    mGPUProfiler.Shutdown(device);
+    mDebugUI.Shutdown(device);
+}
+
+void Application::SyncUIState() {
+    const auto& uiState = mDebugUI.GetState();
+
+    bool gpuChanged = (mGPUDriven != uiState.gpuDriven) ||
+                      (mOcclusionCulling != uiState.occlusionCulling);
+
+    mGPUDriven        = uiState.gpuDriven;
+    mOcclusionCulling = uiState.occlusionCulling;
+    mOccluderRatio    = uiState.occluderRatio;
+
+    mPipelineStats.SetEnabled(uiState.pipelineStatsEnabled);
+
+    if (gpuChanged) {
+        LOG_INFO("Render mode changed: GPU-driven={}, occlusion={}",
+                 mGPUDriven, mOcclusionCulling);
+    }
+}
+
+void Application::LabelVulkanObjects() {
+    auto device = mDevice.GetHandle();
+
+    ObjectLabeling::NameImage(device, mDepthImage.GetImage(), "DepthBuffer");
+    ObjectLabeling::NameImageView(device, mDepthImage.GetView(), "DepthBuffer_View");
+
+    ObjectLabeling::NamePipeline(device, mPBRPipeline, "PBR_Pipeline");
+    ObjectLabeling::NamePipeline(device, mShadowPipeline, "Shadow_Pipeline");
+
+    if (mPBRIndirectPipeline)
+        ObjectLabeling::NamePipeline(device, mPBRIndirectPipeline, "PBR_Indirect_Pipeline");
+    if (mShadowIndirectPipeline)
+        ObjectLabeling::NamePipeline(device, mShadowIndirectPipeline, "Shadow_Indirect_Pipeline");
+    if (mDepthPrepassPipeline)
+        ObjectLabeling::NamePipeline(device, mDepthPrepassPipeline, "DepthPrepass_Pipeline");
+
+    for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; i++) {
+        std::string name = "FrameUBO_" + std::to_string(i);
+        ObjectLabeling::NameBuffer(device, mFrameUBOs[i].GetHandle(), name.c_str());
+        std::string dsName = "FrameDescSet_" + std::to_string(i);
+        ObjectLabeling::NameDescriptorSet(device, mFrameDescSets[i], dsName.c_str());
+    }
+
+    ObjectLabeling::NameBuffer(device, mMaterialSSBO.GetHandle(), "MaterialSSBO");
+}
+
 void Application::ShutdownGPUDriven() {
     auto device    = mDevice.GetHandle();
     auto allocator = mMemory.GetAllocator();
@@ -1208,6 +1425,9 @@ void Application::CleanupVulkan() {
     auto allocator = mMemory.GetAllocator();
 
     mPipelines.SaveCache("pipeline_cache.bin");
+    mInput.SaveBindings("input_bindings.cfg");
+
+    ShutdownDebugUI();
 
     if (mMultiThreading) {
         mSubmitThread.Drain();

@@ -51,7 +51,13 @@ FetchContent_Declare(tinygltf
     GIT_TAG        v2.9.3
 )
 
-FetchContent_MakeAvailable(volk glfw spdlog glm VulkanMemoryAllocator tinygltf)
+# --- Dear ImGui (docking branch) ---
+FetchContent_Declare(imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        docking
+)
+
+FetchContent_MakeAvailable(volk glfw spdlog glm VulkanMemoryAllocator tinygltf imgui)
 
 # --- Shader compilation ---
 find_program(GLSLANG_VALIDATOR glslangValidator
@@ -85,13 +91,26 @@ add_custom_target(Shaders ALL DEPENDS ${SHADER_OUTPUTS})
 
 # --- Main executable ---
 file(GLOB_RECURSE SOURCES "src/*.cpp" "src/*.h")
-add_executable(${PROJECT_NAME} ${SOURCES})
+
+set(IMGUI_SOURCES
+    "${imgui_SOURCE_DIR}/imgui.cpp"
+    "${imgui_SOURCE_DIR}/imgui_draw.cpp"
+    "${imgui_SOURCE_DIR}/imgui_tables.cpp"
+    "${imgui_SOURCE_DIR}/imgui_widgets.cpp"
+    "${imgui_SOURCE_DIR}/imgui_demo.cpp"
+    "${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp"
+    "${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp"
+)
+
+add_executable(${PROJECT_NAME} ${SOURCES} ${IMGUI_SOURCES})
 add_dependencies(${PROJECT_NAME} Shaders)
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     "${CMAKE_SOURCE_DIR}/src"
     "${vulkanmemoryallocator_SOURCE_DIR}/include"
     "${tinygltf_SOURCE_DIR}"
+    "${imgui_SOURCE_DIR}"
+    "${imgui_SOURCE_DIR}/backends"
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -107,6 +126,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
     VMA_DYNAMIC_VULKAN_FUNCTIONS=1
     GLM_FORCE_DEPTH_ZERO_TO_ONE
     NOMINMAX
+    IMGUI_IMPL_VULKAN_NO_PROTOTYPES
 )
 
 # VS debugger working directory = build dir (so it finds shaders/)

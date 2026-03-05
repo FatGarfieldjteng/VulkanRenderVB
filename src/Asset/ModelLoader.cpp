@@ -2,6 +2,10 @@
 #include "Math/AABB.h"
 #include "Core/Logger.h"
 
+#define BCDEC_IMPLEMENTATION
+#include "Asset/bcdec.h"
+
+#include <stb_image.h>
 #include <tiny_gltf.h>
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
@@ -9,6 +13,8 @@
 #include <cmath>
 #include <numeric>
 #include <functional>
+#include <fstream>
+#include <filesystem>
 
 static int ResolveTextureSource(const tinygltf::Model& model, int texIndex) {
     if (texIndex >= 0 && texIndex < static_cast<int>(model.textures.size()))
@@ -16,17 +22,217 @@ static int ResolveTextureSource(const tinygltf::Model& model, int texIndex) {
     return -1;
 }
 
+// -----------------------------------------------------------------------
+// DDS loader -- decodes BC5/BC7 (DX10 header) to RGBA using bcdec
+// -----------------------------------------------------------------------
+
+struct DDSHeader {
+    uint32_t size, flags, height, width, pitchOrLinearSize, depth, mipMapCount;
+    uint32_t reserved1[11];
+    struct { uint32_t size, flags, fourCC, rgbBitCount, rMask, gMask, bMask, aMask; } pf;
+    uint32_t caps, caps2, caps3, caps4, reserved2;
+};
+
+static constexpr uint32_t kDDSMagic   = 0x20534444; // "DDS "
+static constexpr uint32_t kFourCC_DX10 = 0x30315844; // "DX10"
+static constexpr uint32_t kDXGI_BC1_UNORM      = 71;
+static constexpr uint32_t kDXGI_BC1_UNORM_SRGB = 72;
+static constexpr uint32_t kDXGI_BC3_UNORM      = 77;
+static constexpr uint32_t kDXGI_BC3_UNORM_SRGB = 84;
+static constexpr uint32_t kDXGI_BC4_UNORM      = 80;
+static constexpr uint32_t kDXGI_BC5_UNORM      = 83;
+static constexpr uint32_t kDXGI_BC7_UNORM      = 98;
+static constexpr uint32_t kDXGI_BC7_UNORM_SRGB = 99;
+
+static bool DecodeDDS(const unsigned char* data, int dataSize,
+                      int& outW, int& outH, std::vector<unsigned char>& outRGBA) {
+    if (dataSize < 128) return false;
+
+    uint32_t magic;
+    std::memcpy(&magic, data, 4);
+    if (magic != kDDSMagic) return false;
+
+    DDSHeader hdr;
+    std::memcpy(&hdr, data + 4, sizeof(DDSHeader));
+
+    const unsigned char* src = data + 4 + sizeof(DDSHeader);
+    int remaining = dataSize - 4 - static_cast<int>(sizeof(DDSHeader));
+
+    uint32_t dxgiFormat = 0;
+    if (hdr.pf.fourCC == kFourCC_DX10) {
+        if (remaining < 20) return false;
+        std::memcpy(&dxgiFormat, src, 4);
+        src += 20;
+        remaining -= 20;
+    } else {
+        return false;
+    }
+
+    outW = static_cast<int>(hdr.width);
+    outH = static_cast<int>(hdr.height);
+    int bw = (outW + 3) / 4;
+    int bh = (outH + 3) / 4;
+
+    int blockSize = 0;
+    enum { FMT_BC1, FMT_BC3, FMT_BC4, FMT_BC5, FMT_BC7 } fmt;
+
+    switch (dxgiFormat) {
+    case kDXGI_BC1_UNORM: case kDXGI_BC1_UNORM_SRGB:
+        blockSize = BCDEC_BC1_BLOCK_SIZE; fmt = FMT_BC1; break;
+    case kDXGI_BC3_UNORM: case kDXGI_BC3_UNORM_SRGB:
+        blockSize = BCDEC_BC3_BLOCK_SIZE; fmt = FMT_BC3; break;
+    case kDXGI_BC4_UNORM:
+        blockSize = BCDEC_BC4_BLOCK_SIZE; fmt = FMT_BC4; break;
+    case kDXGI_BC5_UNORM:
+        blockSize = BCDEC_BC5_BLOCK_SIZE; fmt = FMT_BC5; break;
+    case kDXGI_BC7_UNORM: case kDXGI_BC7_UNORM_SRGB:
+        blockSize = BCDEC_BC7_BLOCK_SIZE; fmt = FMT_BC7; break;
+    default: return false;
+    }
+
+    if (remaining < bw * bh * blockSize) return false;
+
+    outRGBA.resize(outW * outH * 4);
+    unsigned char blockPixels[4 * 4 * 4];
+
+    for (int by = 0; by < bh; by++) {
+        for (int bx = 0; bx < bw; bx++) {
+            const unsigned char* block = src + (by * bw + bx) * blockSize;
+
+            switch (fmt) {
+            case FMT_BC1: bcdec_bc1(block, blockPixels, 4 * 4); break;
+            case FMT_BC3: bcdec_bc3(block, blockPixels, 4 * 4); break;
+            case FMT_BC7: bcdec_bc7(block, blockPixels, 4 * 4); break;
+            case FMT_BC4:
+                bcdec_bc4(block, blockPixels, 4);
+                for (int i = 15; i >= 0; i--) {
+                    blockPixels[i * 4 + 3] = 255;
+                    blockPixels[i * 4 + 2] = blockPixels[i];
+                    blockPixels[i * 4 + 1] = blockPixels[i];
+                    blockPixels[i * 4 + 0] = blockPixels[i];
+                }
+                break;
+            case FMT_BC5: {
+                unsigned char rg[4 * 4 * 2];
+                bcdec_bc5(block, rg, 4 * 2);
+                for (int i = 0; i < 16; i++) {
+                    blockPixels[i * 4 + 0] = rg[i * 2 + 0];
+                    blockPixels[i * 4 + 1] = rg[i * 2 + 1];
+                    blockPixels[i * 4 + 2] = 128;
+                    blockPixels[i * 4 + 3] = 255;
+                }
+                break;
+            }
+            }
+
+            for (int py = 0; py < 4 && by * 4 + py < outH; py++)
+                for (int px = 0; px < 4 && bx * 4 + px < outW; px++)
+                    std::memcpy(&outRGBA[((by * 4 + py) * outW + (bx * 4 + px)) * 4],
+                                &blockPixels[(py * 4 + px) * 4], 4);
+        }
+    }
+    return true;
+}
+
+// -----------------------------------------------------------------------
+// Tolerant tinygltf callbacks: redirect missing .png -> .dds, decode DDS
+// -----------------------------------------------------------------------
+
+static bool TolerantFileExists(const std::string& path, void*) {
+    if (std::filesystem::exists(path)) return true;
+    if (path.size() > 4 && path.substr(path.size() - 4) == ".png") {
+        std::string dds = path.substr(0, path.size() - 4) + ".dds";
+        return std::filesystem::exists(dds);
+    }
+    return false;
+}
+
+static std::string TolerantExpandPath(const std::string& path, void*) { return path; }
+
+static bool TolerantReadFile(std::vector<unsigned char>* out, std::string* err,
+                             const std::string& path, void*) {
+    auto tryRead = [&](const std::string& p) -> bool {
+        std::ifstream f(p, std::ios::binary | std::ios::ate);
+        if (!f) return false;
+        auto sz = f.tellg();
+        f.seekg(0);
+        out->resize(static_cast<size_t>(sz));
+        f.read(reinterpret_cast<char*>(out->data()), sz);
+        return true;
+    };
+
+    if (tryRead(path)) return true;
+
+    if (path.size() > 4 && path.substr(path.size() - 4) == ".png") {
+        std::string dds = path.substr(0, path.size() - 4) + ".dds";
+        if (tryRead(dds)) return true;
+    }
+
+    out->clear();
+    return true;
+}
+
+static bool TolerantWriteFile(std::string*, const std::string&,
+                              const std::vector<unsigned char>&, void*) { return true; }
+
+static bool DDSImageLoader(tinygltf::Image* image, const int,
+                           std::string* err, std::string* warn,
+                           int, int,
+                           const unsigned char* bytes, int size,
+                           void*) {
+    if (!bytes || size == 0) {
+        image->width = 1; image->height = 1; image->component = 4; image->bits = 8;
+        image->pixel_type = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+        image->image = {200, 200, 200, 255};
+        return true;
+    }
+
+    int w = 0, h = 0;
+    std::vector<unsigned char> rgba;
+    if (DecodeDDS(bytes, size, w, h, rgba)) {
+        image->width = w; image->height = h; image->component = 4; image->bits = 8;
+        image->pixel_type = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+        image->image = std::move(rgba);
+        return true;
+    }
+
+    int comp = 0;
+    unsigned char* stb = stbi_load_from_memory(bytes, size, &w, &h, &comp, 4);
+    if (stb) {
+        image->width = w; image->height = h; image->component = 4; image->bits = 8;
+        image->pixel_type = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+        image->image.assign(stb, stb + w * h * 4);
+        stbi_image_free(stb);
+        return true;
+    }
+
+    image->width = 1; image->height = 1; image->component = 4; image->bits = 8;
+    image->pixel_type = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+    image->image = {200, 200, 200, 255};
+    return true;
+}
+
+// -----------------------------------------------------------------------
+
 bool ModelLoader::LoadGLTF(const std::string& path, ModelData& outModel) {
     tinygltf::Model    gltfModel;
     tinygltf::TinyGLTF loader;
     std::string        err, warn;
 
+    tinygltf::FsCallbacks fsCallbacks;
+    fsCallbacks.FileExists    = TolerantFileExists;
+    fsCallbacks.ExpandFilePath = TolerantExpandPath;
+    fsCallbacks.ReadWholeFile = TolerantReadFile;
+    fsCallbacks.WriteWholeFile = TolerantWriteFile;
+    fsCallbacks.user_data     = nullptr;
+    loader.SetFsCallbacks(fsCallbacks);
+    loader.SetImageLoader(DDSImageLoader, nullptr);
+
     bool ok = false;
-    if (path.size() >= 4 && path.substr(path.size() - 4) == ".glb") {
+    if (path.size() >= 4 && path.substr(path.size() - 4) == ".glb")
         ok = loader.LoadBinaryFromFile(&gltfModel, &err, &warn, path);
-    } else {
+    else
         ok = loader.LoadASCIIFromFile(&gltfModel, &err, &warn, path);
-    }
 
     if (!warn.empty()) LOG_WARN("glTF warning: {}", warn);
     if (!err.empty())  LOG_ERROR("glTF error: {}", err);

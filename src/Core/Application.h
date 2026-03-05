@@ -28,12 +28,19 @@
 #include "GPU/IndirectRenderer.h"
 #include "GPU/HiZBuffer.h"
 #include "GPU/ComputeCulling.h"
+#include "VisualUI/DebugUI.h"
+#include "VisualUI/GPUProfiler.h"
+#include "VisualUI/DebugVisualization.h"
+#include "VisualUI/PipelineStatistics.h"
 
+#include <string>
 #include <vector>
 
 class Application {
 public:
     void Run();
+    void RunBenchmark(uint32_t frameCount, bool gpuDriven, bool occlusionCulling);
+    void SetScenePath(const std::string& path) { mScenePathOverride = path; }
 
 private:
     void InitWindow();
@@ -53,6 +60,11 @@ private:
     void InitGPUDriven();
     void ShutdownGPUDriven();
     void ExtractFrustumPlanes(const glm::mat4& vp, glm::vec4 planes[6]);
+
+    void InitDebugUI();
+    void ShutdownDebugUI();
+    void SyncUIState();
+    void LabelVulkanObjects();
 
     static constexpr uint32_t WINDOW_WIDTH     = 1280;
     static constexpr uint32_t WINDOW_HEIGHT    = 720;
@@ -140,6 +152,14 @@ private:
     VkDescriptorPool      mShadowIndirectDescPool   = VK_NULL_HANDLE;
     VkDescriptorSet       mShadowIndirectDescSet    = VK_NULL_HANDLE;
 
+    // --- Visual UI (Phase 7) ---
+    DebugUI              mDebugUI;
+    GPUProfiler          mGPUProfiler;
+    DebugVisualization   mDebugVis;
+    PipelineStatistics   mPipelineStats;
+    bool                 mShowUI = true;
+    float                mDeltaTime = 0.0f;
+
     // --- multithreaded rendering ---
     bool             mMultiThreading = false;
     ThreadPool       mThreadPool;
@@ -155,4 +175,7 @@ private:
 
     // --- timing ---
     double mLastFrameTime = 0.0;
+
+    // --- scene override ---
+    std::string mScenePathOverride;
 };

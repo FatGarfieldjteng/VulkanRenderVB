@@ -1,6 +1,9 @@
 #include "RenderGraph/RenderGraph.h"
 #include "RenderGraph/RenderPass.h"
 #include "ImageCache/ImageCache.h"
+#include "VisualUI/GPUProfiler.h"
+#include "VisualUI/PipelineStatistics.h"
+#include "VisualUI/ObjectLabeling.h"
 #include "Core/Logger.h"
 
 #include <algorithm>
@@ -207,7 +210,8 @@ void RenderGraph::ReleaseTransientResources() {
 // Execute: barriers via BarrierBatcher + pass execution
 // =======================================================================
 
-void RenderGraph::Execute(VkCommandBuffer cmd) {
+void RenderGraph::Execute(VkCommandBuffer cmd, GPUProfiler* profiler, uint32_t frameIndex,
+                          PipelineStatistics* pipeStats) {
     if (!mCompiled) {
         LOG_ERROR("RenderGraph::Execute called before Compile");
         return;
@@ -236,7 +240,17 @@ void RenderGraph::Execute(VkCommandBuffer cmd) {
         }
 
         mBarrierBatcher.Flush(cmd);
+
+        const char* passName = entry.pass->GetName().c_str();
+        ObjectLabeling::BeginLabel(cmd, passName);
+        if (profiler) profiler->BeginScope(cmd, frameIndex, passName);
+        if (pipeStats) pipeStats->BeginPass(cmd, frameIndex);
+
         entry.pass->Execute(cmd);
+
+        if (pipeStats) pipeStats->EndPass(cmd, frameIndex);
+        if (profiler) profiler->EndScope(cmd, frameIndex);
+        ObjectLabeling::EndLabel(cmd);
     }
 }
 

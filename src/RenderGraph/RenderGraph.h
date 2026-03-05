@@ -12,6 +12,8 @@
 #include <cstdint>
 
 class ImageCache;
+class GPUProfiler;
+class PipelineStatistics;
 struct CachedImage;
 
 class RenderGraph {
@@ -52,7 +54,8 @@ public:
     // ----- 5. Compile & Execute -----
 
     void Compile();
-    void Execute(VkCommandBuffer cmd);
+    void Execute(VkCommandBuffer cmd, GPUProfiler* profiler = nullptr, uint32_t frameIndex = 0,
+                 PipelineStatistics* pipeStats = nullptr);
 
     void BeginFrame(uint32_t frameNumber);
 

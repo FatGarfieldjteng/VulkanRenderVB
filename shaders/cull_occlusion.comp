@@ -1,0 +1,127 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(std140, set = 0, binding = 0) uniform CullParams {
+    mat4  viewProjection;
+    vec4  frustumPlanes[6];
+    vec2  hiZSize;
+    float nearPlane;
+    float farPlane;
+    uint  drawCount;
+    uint  occluderCount;
+    uint  candidateCount;
+    uint  _pad;
+} params;
+
+struct VkDrawIndexedIndirectCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+
+struct ObjectData {
+    mat4  model;
+    vec4  aabbMin;
+    vec4  aabbMax;
+    uint  materialIndex;
+    uint  _pad[3];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer CandidateIndirect {
+    VkDrawIndexedIndirectCommand candidateCmds[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer ObjectDataBuf {
+    ObjectData objects[];
+};
+
+layout(std430, set = 0, binding = 3) writeonly buffer VisibleIndirect {
+    VkDrawIndexedIndirectCommand visibleCmds[];
+};
+
+layout(std430, set = 0, binding = 4) buffer VisibleCount {
+    uint visibleCountOut;
+};
+
+layout(set = 0, binding = 5) uniform sampler2D hiZMap;
+
+layout(std430, set = 0, binding = 6) readonly buffer CandidateCount {
+    uint candidateCountIn;
+};
+
+bool OcclusionCull(vec3 worldMin, vec3 worldMax) {
+    vec3 corners[8] = vec3[8](
+        vec3(worldMin.x, worldMin.y, worldMin.z),
+        vec3(worldMax.x, worldMin.y, worldMin.z),
+        vec3(worldMin.x, worldMax.y, worldMin.z),
+        vec3(worldMax.x, worldMax.y, worldMin.z),
+        vec3(worldMin.x, worldMin.y, worldMax.z),
+        vec3(worldMax.x, worldMin.y, worldMax.z),
+        vec3(worldMin.x, worldMax.y, worldMax.z),
+        vec3(worldMax.x, worldMax.y, worldMax.z)
+    );
+
+    vec2 ndcMin = vec2(1.0);
+    vec2 ndcMax = vec2(-1.0);
+    float closestZ = 1.0;
+
+    for (uint i = 0; i < 8; i++) {
+        vec4 clip = params.viewProjection * vec4(corners[i], 1.0);
+        if (clip.w <= 0.0) return false;
+        vec3 ndc = clip.xyz / clip.w;
+        ndcMin = min(ndcMin, ndc.xy);
+        ndcMax = max(ndcMax, ndc.xy);
+        closestZ = min(closestZ, ndc.z);
+    }
+
+    vec2 uvMin = ndcMin * 0.5 + 0.5;
+    vec2 uvMax = ndcMax * 0.5 + 0.5;
+    uvMin = clamp(uvMin, vec2(0.0), vec2(1.0));
+    uvMax = clamp(uvMax, vec2(0.0), vec2(1.0));
+
+    vec2 sizePixels = (uvMax - uvMin) * params.hiZSize;
+    float mipLevel = ceil(log2(max(sizePixels.x, sizePixels.y)));
+    mipLevel = clamp(mipLevel, 0.0, float(textureQueryLevels(hiZMap) - 1));
+
+    float sampledDepth = textureLod(hiZMap, (uvMin + uvMax) * 0.5, mipLevel).r;
+
+    return closestZ > sampledDepth;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= candidateCountIn) return;
+
+    VkDrawIndexedIndirectCommand cmd = candidateCmds[idx];
+    ObjectData obj = objects[cmd.firstInstance];
+
+    vec3 localMin = obj.aabbMin.xyz;
+    vec3 localMax = obj.aabbMax.xyz;
+
+    vec3 corners[8] = vec3[8](
+        vec3(localMin.x, localMin.y, localMin.z),
+        vec3(localMax.x, localMin.y, localMin.z),
+        vec3(localMin.x, localMax.y, localMin.z),
+        vec3(localMax.x, localMax.y, localMin.z),
+        vec3(localMin.x, localMin.y, localMax.z),
+        vec3(localMax.x, localMin.y, localMax.z),
+        vec3(localMin.x, localMax.y, localMax.z),
+        vec3(localMax.x, localMax.y, localMax.z)
+    );
+
+    vec3 worldMin = vec3(1e30);
+    vec3 worldMax = vec3(-1e30);
+    for (uint i = 0; i < 8; i++) {
+        vec3 w = (obj.model * vec4(corners[i], 1.0)).xyz;
+        worldMin = min(worldMin, w);
+        worldMax = max(worldMax, w);
+    }
+
+    if (OcclusionCull(worldMin, worldMax)) return;
+
+    uint slot = atomicAdd(visibleCountOut, 1);
+    visibleCmds[slot] = cmd;
+}

@@ -110,16 +110,23 @@ void VulkanDevice::CreateLogicalDevice() {
     VkPhysicalDeviceVulkan12Features features12{};
     features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     features12.pNext = &features13;
+
+    VkPhysicalDeviceVulkan11Features features11{};
+    features11.sType                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    features11.pNext                = &features12;
+    features11.shaderDrawParameters = VK_TRUE;
     features12.descriptorIndexing                          = VK_TRUE;
     features12.descriptorBindingPartiallyBound             = VK_TRUE;
     features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
     features12.runtimeDescriptorArray                      = VK_TRUE;
     features12.shaderSampledImageArrayNonUniformIndexing   = VK_TRUE;
     features12.descriptorBindingVariableDescriptorCount    = VK_TRUE;
+    features12.drawIndirectCount                           = VK_TRUE;
+    features12.samplerFilterMinmax                         = VK_TRUE;
 
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    features2.pNext = &features12;
+    features2.pNext = &features11;
     features2.features.samplerAnisotropy = VK_TRUE;
 
     VkDeviceCreateInfo createInfo{};

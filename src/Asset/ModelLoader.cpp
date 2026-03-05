@@ -1,10 +1,14 @@
 #include "Asset/ModelLoader.h"
+#include "Math/AABB.h"
 #include "Core/Logger.h"
 
 #include <tiny_gltf.h>
+#include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
 #include <cstring>
 #include <cmath>
+#include <numeric>
+#include <functional>
 
 static int ResolveTextureSource(const tinygltf::Model& model, int texIndex) {
     if (texIndex >= 0 && texIndex < static_cast<int>(model.textures.size()))
@@ -177,8 +181,92 @@ bool ModelLoader::LoadGLTF(const std::string& path, ModelData& outModel) {
         }
     }
 
-    LOG_INFO("Loaded glTF: {} meshes, {} textures, {} materials",
-             outModel.meshes.size(), outModel.textures.size(), outModel.materials.size());
+    // Build flat-index offset table: gltf mesh M's first primitive -> flat index
+    std::vector<int> meshPrimOffset(gltfModel.meshes.size(), 0);
+    {
+        int flat = 0;
+        for (size_t m = 0; m < gltfModel.meshes.size(); m++) {
+            meshPrimOffset[m] = flat;
+            for (const auto& prim : gltfModel.meshes[m].primitives)
+                if (prim.mode == TINYGLTF_MODE_TRIANGLES || prim.mode == -1)
+                    flat++;
+        }
+    }
+
+    // Traverse node hierarchy to collect per-mesh-instance transforms
+    std::function<void(int, const glm::mat4&)> traverseNode =
+        [&](int nodeIdx, const glm::mat4& parentWorld) {
+        const auto& node = gltfModel.nodes[nodeIdx];
+
+        glm::mat4 local(1.0f);
+        if (node.matrix.size() == 16) {
+            for (int c = 0; c < 4; c++)
+                for (int r = 0; r < 4; r++)
+                    local[c][r] = static_cast<float>(node.matrix[c * 4 + r]);
+        } else {
+            glm::vec3 t(0.0f);
+            glm::quat rot(1.0f, 0.0f, 0.0f, 0.0f);
+            glm::vec3 s(1.0f);
+            if (node.translation.size() == 3)
+                t = glm::vec3(float(node.translation[0]), float(node.translation[1]),
+                              float(node.translation[2]));
+            if (node.rotation.size() == 4)
+                rot = glm::quat(float(node.rotation[3]), float(node.rotation[0]),
+                                float(node.rotation[1]), float(node.rotation[2]));
+            if (node.scale.size() == 3)
+                s = glm::vec3(float(node.scale[0]), float(node.scale[1]),
+                              float(node.scale[2]));
+            local = glm::translate(glm::mat4(1.0f), t)
+                  * glm::mat4_cast(rot)
+                  * glm::scale(glm::mat4(1.0f), s);
+        }
+
+        glm::mat4 world = parentWorld * local;
+
+        if (node.mesh >= 0 && node.mesh < static_cast<int>(gltfModel.meshes.size())) {
+            int baseFlat = meshPrimOffset[node.mesh];
+            int primCount = 0;
+            for (const auto& prim : gltfModel.meshes[node.mesh].primitives) {
+                if (prim.mode == TINYGLTF_MODE_TRIANGLES || prim.mode == -1) {
+                    MeshInstance inst;
+                    inst.meshIndex = baseFlat + primCount;
+
+                    inst.translation = glm::vec3(world[3]);
+                    glm::vec3 cx = glm::vec3(world[0]);
+                    glm::vec3 cy = glm::vec3(world[1]);
+                    glm::vec3 cz = glm::vec3(world[2]);
+                    float lx = glm::length(cx), ly = glm::length(cy), lz = glm::length(cz);
+                    inst.scale = glm::vec3(lx, ly, lz);
+                    if (lx > 1e-6f && ly > 1e-6f && lz > 1e-6f)
+                        inst.rotation = glm::quat_cast(glm::mat3(cx / lx, cy / ly, cz / lz));
+
+                    outModel.instances.push_back(inst);
+                    primCount++;
+                }
+            }
+        }
+
+        for (int child : node.children)
+            traverseNode(child, world);
+    };
+
+    if (!gltfModel.scenes.empty()) {
+        int sceneIdx = gltfModel.defaultScene >= 0 ? gltfModel.defaultScene : 0;
+        for (int rootNode : gltfModel.scenes[sceneIdx].nodes)
+            traverseNode(rootNode, glm::mat4(1.0f));
+    }
+
+    if (outModel.instances.empty()) {
+        for (size_t i = 0; i < outModel.meshes.size(); i++) {
+            MeshInstance inst;
+            inst.meshIndex = static_cast<int>(i);
+            outModel.instances.push_back(inst);
+        }
+    }
+
+    LOG_INFO("Loaded glTF: {} meshes, {} textures, {} materials, {} instances",
+             outModel.meshes.size(), outModel.textures.size(),
+             outModel.materials.size(), outModel.instances.size());
     return true;
 }
 
@@ -302,4 +390,25 @@ void ModelLoader::GenerateGroundPlane(MeshData& outMesh, float halfSize) {
         {{-halfSize, 0,  halfSize}, {0, 1, 0}, {0,       uvScale}, {1, 0, 0, 1}},
     };
     outMesh.indices = { 0, 2, 1, 0, 3, 2 };
+}
+
+void ModelLoader::SortMeshesByVolume(std::vector<MeshData>& meshes) {
+    if (meshes.empty()) return;
+
+    const uint32_t count = static_cast<uint32_t>(meshes.size());
+    std::vector<AABB> aabbs(count);
+    for (uint32_t i = 0; i < count; i++)
+        for (const auto& v : meshes[i].vertices)
+            aabbs[i].Include(v.position);
+
+    std::vector<uint32_t> perm(count);
+    std::iota(perm.begin(), perm.end(), 0u);
+    std::sort(perm.begin(), perm.end(), [&](uint32_t a, uint32_t b) {
+        return aabbs[a].Volume() > aabbs[b].Volume();
+    });
+
+    std::vector<MeshData> sorted(count);
+    for (uint32_t i = 0; i < count; i++)
+        sorted[i] = std::move(meshes[perm[i]]);
+    meshes = std::move(sorted);
 }

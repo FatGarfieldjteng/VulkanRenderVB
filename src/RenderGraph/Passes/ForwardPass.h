@@ -9,8 +9,8 @@
 #include <glm/glm.hpp>
 #include <vector>
 
-struct GPUMesh;
 class DescriptorManager;
+class MeshPool;
 
 class ForwardPass : public RenderPass {
 public:
@@ -27,8 +27,23 @@ public:
         VkDescriptorSet         bindlessSet;
         VkDescriptorSet         frameDescSet;
         const Registry*         registry;
-        const std::vector<GPUMesh>*         gpuMeshes;
+        const MeshPool*         meshPool             = nullptr;
         const std::vector<GPUMaterialData>* gpuMaterials;
+
+        bool                    gpuDriven            = false;
+        bool                    occlusionEnabled     = false;
+        VkPipeline              indirectPipeline     = VK_NULL_HANDLE;
+        VkPipelineLayout        indirectPipelineLayout = VK_NULL_HANDLE;
+
+        VkBuffer                occluderBuffer       = VK_NULL_HANDLE;
+        VkBuffer                occluderCountBuffer  = VK_NULL_HANDLE;
+        uint32_t                maxOccluderCount     = 0;
+        VkBuffer                visibleBuffer        = VK_NULL_HANDLE;
+        VkBuffer                visibleCountBuffer   = VK_NULL_HANDLE;
+        uint32_t                maxVisibleCount      = 0;
+
+        PassHandle              occlusionTestPassHandle = UINT32_MAX;
+        PassHandle              frustumCullPassHandle   = UINT32_MAX;
     };
 
     explicit ForwardPass(const Desc& desc);

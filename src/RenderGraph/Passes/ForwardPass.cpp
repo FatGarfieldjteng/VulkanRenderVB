@@ -1,5 +1,5 @@
 #include "RenderGraph/Passes/ForwardPass.h"
-#include "Core/Application.h"
+#include "GPU/MeshPool.h"
 
 #include <algorithm>
 
@@ -22,6 +22,13 @@ void ForwardPass::Setup(RenderGraph& graph, PassHandle self) {
                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
     graph.DependsOn(self, mDesc.csmResource, mDesc.shadowPassHandle);
+
+    if (mDesc.gpuDriven) {
+        PassHandle cullDep = mDesc.occlusionEnabled
+                           ? mDesc.occlusionTestPassHandle
+                           : mDesc.frustumCullPassHandle;
+        graph.DependsOn(self, mDesc.depthResource, cullDep);
+    }
 }
 
 void ForwardPass::Execute(VkCommandBuffer cmd) {
@@ -37,7 +44,8 @@ void ForwardPass::Execute(VkCommandBuffer cmd) {
     depthAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     depthAtt.imageView   = mDesc.depthView;
     depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    depthAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAtt.loadOp      = (mDesc.gpuDriven && mDesc.occlusionEnabled)
+                         ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
     depthAtt.clearValue.depthStencil = {1.0f, 0};
 
@@ -55,32 +63,58 @@ void ForwardPass::Execute(VkCommandBuffer cmd) {
     VkRect2D sc{{0, 0}, mDesc.extent};
     vkCmdSetScissor(cmd, 0, 1, &sc);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, mDesc.pipeline);
+    VkBuffer vb[] = { mDesc.meshPool->GetVertexBuffer() };
+    VkDeviceSize offsets[] = { 0 };
+    vkCmdBindVertexBuffers(cmd, 0, 1, vb, offsets);
+    vkCmdBindIndexBuffer(cmd, mDesc.meshPool->GetIndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
 
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            mDesc.pipelineLayout, 0, 1, &mDesc.bindlessSet, 0, nullptr);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            mDesc.pipelineLayout, 1, 1, &mDesc.frameDescSet, 0, nullptr);
+    if (mDesc.gpuDriven && mDesc.indirectPipeline != VK_NULL_HANDLE) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, mDesc.indirectPipeline);
 
-    mDesc.registry->ForEachRenderable([&](Entity, const TransformComponent& tc,
-                                          const MeshComponent& mc, const MaterialComponent& matc) {
-        if (mc.meshIndex >= static_cast<int>(mDesc.gpuMeshes->size())) return;
-        int matIdx = std::clamp(matc.materialIndex, 0, static_cast<int>(mDesc.gpuMaterials->size()) - 1);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                mDesc.indirectPipelineLayout, 0, 1, &mDesc.bindlessSet, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                mDesc.indirectPipelineLayout, 1, 1, &mDesc.frameDescSet, 0, nullptr);
 
-        PBRPushConstants pc{};
-        pc.model         = tc.worldMatrix;
-        pc.materialIndex = static_cast<uint32_t>(matIdx);
+        const uint32_t stride = sizeof(VkDrawIndexedIndirectCommand);
 
-        vkCmdPushConstants(cmd, mDesc.pipelineLayout,
-                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                           0, static_cast<uint32_t>(sizeof(glm::mat4) + sizeof(uint32_t)), &pc);
+        vkCmdDrawIndexedIndirectCount(cmd,
+            mDesc.occluderBuffer, 0,
+            mDesc.occluderCountBuffer, 0,
+            mDesc.maxOccluderCount, stride);
 
-        const auto& mesh = (*mDesc.gpuMeshes)[mc.meshIndex];
-        VkBuffer vb[] = { mesh.vertexBuffer.GetHandle() };
-        VkDeviceSize off[] = { 0 };
-        vkCmdBindVertexBuffers(cmd, 0, 1, vb, off);
-        vkCmdBindIndexBuffer(cmd, mesh.indexBuffer.GetHandle(), 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
-    });
+        if (mDesc.occlusionEnabled) {
+            vkCmdDrawIndexedIndirectCount(cmd,
+                mDesc.visibleBuffer, 0,
+                mDesc.visibleCountBuffer, 0,
+                mDesc.maxVisibleCount, stride);
+        }
+    } else {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, mDesc.pipeline);
+
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                mDesc.pipelineLayout, 0, 1, &mDesc.bindlessSet, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                mDesc.pipelineLayout, 1, 1, &mDesc.frameDescSet, 0, nullptr);
+
+        const auto& drawCmds = mDesc.meshPool->GetDrawCommands();
+
+        mDesc.registry->ForEachRenderable([&](Entity, const TransformComponent& tc,
+                                              const MeshComponent& mc, const MaterialComponent& matc) {
+            if (mc.meshIndex < 0 || mc.meshIndex >= static_cast<int>(drawCmds.size())) return;
+            int matIdx = std::clamp(matc.materialIndex, 0, static_cast<int>(mDesc.gpuMaterials->size()) - 1);
+
+            PBRPushConstants pc{};
+            pc.model         = tc.worldMatrix;
+            pc.materialIndex = static_cast<uint32_t>(matIdx);
+
+            vkCmdPushConstants(cmd, mDesc.pipelineLayout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, static_cast<uint32_t>(sizeof(glm::mat4) + sizeof(uint32_t)), &pc);
+
+            const auto& poolCmd = drawCmds[mc.meshIndex];
+            vkCmdDrawIndexed(cmd, poolCmd.indexCount, 1, poolCmd.firstIndex, poolCmd.vertexOffset, 0);
+        });
+    }
     vkCmdEndRendering(cmd);
 }

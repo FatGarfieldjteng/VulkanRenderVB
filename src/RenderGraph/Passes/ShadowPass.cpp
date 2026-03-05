@@ -1,5 +1,5 @@
 #include "RenderGraph/Passes/ShadowPass.h"
-#include "Core/Application.h"  // GPUMesh definition
+#include "GPU/MeshPool.h"
 
 ShadowPass::ShadowPass(const Desc& desc)
     : RenderPass("Shadow"), mDesc(desc) {}
@@ -36,21 +36,43 @@ void ShadowPass::Execute(VkCommandBuffer cmd) {
         VkRect2D sc{{0, 0}, {SD, SD}};
         vkCmdSetScissor(cmd, 0, 1, &sc);
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, mDesc.pipeline);
+        VkBuffer vb[] = { mDesc.meshPool->GetVertexBuffer() };
+        VkDeviceSize offsets[] = { 0 };
+        vkCmdBindVertexBuffers(cmd, 0, 1, vb, offsets);
+        vkCmdBindIndexBuffer(cmd, mDesc.meshPool->GetIndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
 
-        mDesc.registry->ForEachRenderable([&](Entity, const TransformComponent& tc,
-                                              const MeshComponent& mc, const MaterialComponent&) {
-            if (mc.meshIndex >= static_cast<int>(mDesc.gpuMeshes->size())) return;
-            glm::mat4 mvp = mDesc.csm->GetViewProj(cascade) * tc.worldMatrix;
-            vkCmdPushConstants(cmd, mDesc.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-                               0, sizeof(glm::mat4), &mvp);
-            const auto& mesh = (*mDesc.gpuMeshes)[mc.meshIndex];
-            VkBuffer vb[] = { mesh.vertexBuffer.GetHandle() };
-            VkDeviceSize off[] = { 0 };
-            vkCmdBindVertexBuffers(cmd, 0, 1, vb, off);
-            vkCmdBindIndexBuffer(cmd, mesh.indexBuffer.GetHandle(), 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
-        });
+        if (mDesc.gpuDriven && mDesc.indirectPipeline != VK_NULL_HANDLE) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, mDesc.indirectPipeline);
+
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    mDesc.indirectPipelineLayout, 0, 1,
+                                    &mDesc.indirectDescSet, 0, nullptr);
+
+            glm::mat4 cascadeVP = mDesc.csm->GetViewProj(cascade);
+            vkCmdPushConstants(cmd, mDesc.indirectPipelineLayout,
+                               VK_SHADER_STAGE_VERTEX_BIT,
+                               0, sizeof(glm::mat4), &cascadeVP);
+
+            vkCmdDrawIndexedIndirectCount(cmd,
+                mDesc.indirectBuffer, 0,
+                mDesc.countBuffer, 0,
+                mDesc.maxDrawCount,
+                sizeof(VkDrawIndexedIndirectCommand));
+        } else {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, mDesc.pipeline);
+
+            const auto& drawCmds = mDesc.meshPool->GetDrawCommands();
+
+            mDesc.registry->ForEachRenderable([&](Entity, const TransformComponent& tc,
+                                                  const MeshComponent& mc, const MaterialComponent&) {
+                if (mc.meshIndex < 0 || mc.meshIndex >= static_cast<int>(drawCmds.size())) return;
+                glm::mat4 mvp = mDesc.csm->GetViewProj(cascade) * tc.worldMatrix;
+                vkCmdPushConstants(cmd, mDesc.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+                                   0, sizeof(glm::mat4), &mvp);
+                const auto& poolCmd = drawCmds[mc.meshIndex];
+                vkCmdDrawIndexed(cmd, poolCmd.indexCount, 1, poolCmd.firstIndex, poolCmd.vertexOffset, 0);
+            });
+        }
         vkCmdEndRendering(cmd);
     }
 }

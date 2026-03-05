@@ -1,0 +1,20 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D srcDepth;
+layout(set = 0, binding = 1, r32f) writeonly uniform image2D dstMip;
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dstSize = imageSize(dstMip);
+
+    if (pos.x >= dstSize.x || pos.y >= dstSize.y) return;
+
+    vec2 uv = (vec2(pos) + 0.5) / vec2(dstSize);
+
+    vec4 depths = textureGather(srcDepth, uv, 0);
+    float maxDepth = max(max(depths.x, depths.y), max(depths.z, depths.w));
+
+    imageStore(dstMip, pos, vec4(maxDepth, 0, 0, 0));
+}

@@ -2,6 +2,8 @@
 
 #include "Core/Window.h"
 #include "Core/InputManager.h"
+#include "Core/ThreadPool.h"
+#include "Core/SubmitThread.h"
 #include "RHI/VulkanInstance.h"
 #include "RHI/VulkanDevice.h"
 #include "RHI/VulkanSwapchain.h"
@@ -22,14 +24,12 @@
 #include "IBL/IBLProcessor.h"
 #include "ImageCache/ImageCache.h"
 #include "RenderGraph/RenderGraph.h"
+#include "GPU/MeshPool.h"
+#include "GPU/IndirectRenderer.h"
+#include "GPU/HiZBuffer.h"
+#include "GPU/ComputeCulling.h"
 
 #include <vector>
-
-struct GPUMesh {
-    VulkanBuffer vertexBuffer;
-    VulkanBuffer indexBuffer;
-    uint32_t     indexCount = 0;
-};
 
 class Application {
 public:
@@ -45,9 +45,14 @@ private:
     void CreatePipelines();
     void MainLoop();
     void DrawFrame();
+    void DrawFrameMultiThreaded();
     void BuildAndExecuteRenderGraph(VkCommandBuffer cmd, uint32_t imageIndex);
     void RecreateSwapchain();
     void CleanupVulkan();
+
+    void InitGPUDriven();
+    void ShutdownGPUDriven();
+    void ExtractFrustumPlanes(const glm::mat4& vp, glm::vec4 planes[6]);
 
     static constexpr uint32_t WINDOW_WIDTH     = 1280;
     static constexpr uint32_t WINDOW_HEIGHT    = 720;
@@ -86,7 +91,6 @@ private:
 
     // --- GPU scene data ---
     ModelData                    mModelData;
-    std::vector<GPUMesh>         mGPUMeshes;
     std::vector<VulkanImage>     mGPUTextures;
     std::vector<uint32_t>        mTextureDescriptorIndices;
     std::vector<GPUMaterialData> mGPUMaterials;
@@ -105,7 +109,7 @@ private:
     // --- per-frame UBOs ---
     std::vector<VulkanBuffer> mFrameUBOs;
 
-    // --- frame descriptor resources (set 1: 6 bindings) ---
+    // --- frame descriptor resources (set 1: 7 bindings) ---
     VkDescriptorSetLayout        mFrameSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool             mFrameDescPool  = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> mFrameDescSets;
@@ -115,6 +119,33 @@ private:
     VkPipeline       mPBRPipeline              = VK_NULL_HANDLE;
     VkPipelineLayout mShadowPipelineLayout     = VK_NULL_HANDLE;
     VkPipeline       mShadowPipeline           = VK_NULL_HANDLE;
+
+    // --- GPU-driven rendering (Phase 6) ---
+    bool             mGPUDriven = true;
+    bool             mOcclusionCulling = true;
+    float            mOccluderRatio = 0.2f;
+    MeshPool         mMeshPool;
+    IndirectRenderer mIndirectRenderer;
+    HiZBuffer        mHiZBuffer;
+    ComputeCulling   mComputeCulling;
+
+    VkPipelineLayout mPBRIndirectPipelineLayout    = VK_NULL_HANDLE;
+    VkPipeline       mPBRIndirectPipeline          = VK_NULL_HANDLE;
+    VkPipelineLayout mShadowIndirectPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline       mShadowIndirectPipeline       = VK_NULL_HANDLE;
+    VkPipelineLayout mDepthPrepassPipelineLayout   = VK_NULL_HANDLE;
+    VkPipeline       mDepthPrepassPipeline         = VK_NULL_HANDLE;
+
+    VkDescriptorSetLayout mShadowIndirectDescLayout = VK_NULL_HANDLE;
+    VkDescriptorPool      mShadowIndirectDescPool   = VK_NULL_HANDLE;
+    VkDescriptorSet       mShadowIndirectDescSet    = VK_NULL_HANDLE;
+
+    // --- multithreaded rendering ---
+    bool             mMultiThreading = false;
+    ThreadPool       mThreadPool;
+    SubmitThread     mSubmitThread;
+    std::vector<VkCommandPool>   mWorkerCommandPools;
+    std::vector<VkCommandBuffer> mSecondaryCommandBuffers;
 
     // --- sync ---
     std::vector<VkFence> mImageFences;

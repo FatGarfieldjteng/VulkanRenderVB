@@ -4,6 +4,14 @@
 #include "RenderGraph/Passes/ShadowPass.h"
 #include "RenderGraph/Passes/ForwardPass.h"
 #include "RenderGraph/Passes/PresentPass.h"
+#include "RenderGraph/Passes/FrustumCullPass.h"
+#include "RenderGraph/Passes/OccluderDepthPass.h"
+#include "RenderGraph/Passes/HiZBuildPass.h"
+#include "RenderGraph/Passes/OcclusionTestPass.h"
+#include "GPU/MeshPool.h"
+#include "GPU/IndirectRenderer.h"
+#include "GPU/HiZBuffer.h"
+#include "GPU/ComputeCulling.h"
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -69,10 +77,37 @@ void Application::InitVulkan() {
     CreateFrameDescriptors();
     CreatePipelines();
 
-    mCamera.Init(glm::vec3(0, 200, 0), glm::vec3(0, 200, -100), 45.0f, 1.0f, 5000.0f);
+    InitGPUDriven();
+
+    mModelData = ModelData{};
+
+    if (mMultiThreading) {
+        mThreadPool.Initialize();
+        mSubmitThread.Initialize(mDevice.GetGraphicsQueue(), mDevice.GetPresentQueue());
+
+        uint32_t workerCount = mThreadPool.GetThreadCount();
+        mWorkerCommandPools.resize(workerCount);
+        mSecondaryCommandBuffers.resize(workerCount);
+        for (uint32_t i = 0; i < workerCount; i++) {
+            VkCommandPoolCreateInfo poolCI{};
+            poolCI.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            poolCI.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+            poolCI.queueFamilyIndex = mDevice.GetQueueFamilyIndices().graphicsFamily;
+            VK_CHECK(vkCreateCommandPool(mDevice.GetHandle(), &poolCI, nullptr, &mWorkerCommandPools[i]));
+
+            VkCommandBufferAllocateInfo allocCI{};
+            allocCI.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            allocCI.commandPool        = mWorkerCommandPools[i];
+            allocCI.level              = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+            allocCI.commandBufferCount = 1;
+            VK_CHECK(vkAllocateCommandBuffers(mDevice.GetHandle(), &allocCI, &mSecondaryCommandBuffers[i]));
+        }
+    }
+
+    mCamera.Init(glm::vec3(0, 1.6f, 0), glm::vec3(0, 1.6f, -1.0f), 45.0f, 0.01f, 100.0f);
     mLastFrameTime = glfwGetTime();
 
-    LOG_INFO("Vulkan initialization complete (Phase 5 — Render Graph)");
+    LOG_INFO("Vulkan initialization complete (Phase 6 - GPU-Driven Rendering)");
 }
 
 // =======================================================================
@@ -141,6 +176,8 @@ void Application::LoadScene() {
     }
 
     if (loaded) {
+        ModelLoader::SortMeshesByVolume(mModelData.meshes);
+
         std::vector<bool> isLinear(mModelData.textures.size(), false);
         for (const auto& mat : mModelData.materials) {
             if (mat.metallicRoughnessTextureIndex >= 0)
@@ -164,18 +201,6 @@ void Application::LoadScene() {
             mTextureDescriptorIndices.push_back(descIdx);
         }
 
-        for (auto& meshData : mModelData.meshes) {
-            GPUMesh gpu;
-            gpu.indexCount = static_cast<uint32_t>(meshData.indices.size());
-            gpu.vertexBuffer.CreateDeviceLocal(allocator, mTransfer,
-                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                meshData.vertices.data(), meshData.vertices.size() * sizeof(MeshVertex));
-            gpu.indexBuffer.CreateDeviceLocal(allocator, mTransfer,
-                VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                meshData.indices.data(), meshData.indices.size() * sizeof(uint32_t));
-            mGPUMeshes.push_back(std::move(gpu));
-        }
-
         auto resolveIdx = [&](int texIdx, uint32_t fallback) -> uint32_t {
             if (texIdx >= 0 && texIdx < static_cast<int>(mTextureDescriptorIndices.size()))
                 return mTextureDescriptorIndices[texIdx];
@@ -195,11 +220,16 @@ void Application::LoadScene() {
             mGPUMaterials.push_back(g);
         }
 
-        for (size_t i = 0; i < mModelData.meshes.size(); i++) {
+        for (const auto& inst : mModelData.instances) {
+            if (inst.meshIndex < 0 || inst.meshIndex >= static_cast<int>(mModelData.meshes.size()))
+                continue;
             Entity e = mRegistry.CreateEntity();
-            mRegistry.AddTransform(e);
-            mRegistry.AddMesh(e).meshIndex = static_cast<int>(i);
-            mRegistry.AddMaterial(e).materialIndex = std::max(0, mModelData.meshes[i].materialIndex);
+            auto& tc = mRegistry.AddTransform(e);
+            tc.localPosition = inst.translation;
+            tc.localRotation = inst.rotation;
+            tc.localScale    = inst.scale;
+            mRegistry.AddMesh(e).meshIndex = inst.meshIndex;
+            mRegistry.AddMaterial(e).materialIndex = std::max(0, mModelData.meshes[inst.meshIndex].materialIndex);
         }
 
     } else {
@@ -230,29 +260,12 @@ void Application::LoadScene() {
         {
             MeshData groundMesh;
             ModelLoader::GenerateGroundPlane(groundMesh, 20.0f);
-            GPUMesh gpu;
-            gpu.indexCount = static_cast<uint32_t>(groundMesh.indices.size());
-            gpu.vertexBuffer.CreateDeviceLocal(allocator, mTransfer,
-                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                groundMesh.vertices.data(), groundMesh.vertices.size() * sizeof(MeshVertex));
-            gpu.indexBuffer.CreateDeviceLocal(allocator, mTransfer,
-                VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                groundMesh.indices.data(), groundMesh.indices.size() * sizeof(uint32_t));
-            mGPUMeshes.push_back(std::move(gpu));
+            mModelData.meshes.push_back(std::move(groundMesh));
         }
         {
             ModelData cubeData;
             ModelLoader::GenerateProceduralCube(cubeData);
-            const auto& cm = cubeData.meshes[0];
-            GPUMesh gpu;
-            gpu.indexCount = static_cast<uint32_t>(cm.indices.size());
-            gpu.vertexBuffer.CreateDeviceLocal(allocator, mTransfer,
-                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                cm.vertices.data(), cm.vertices.size() * sizeof(MeshVertex));
-            gpu.indexBuffer.CreateDeviceLocal(allocator, mTransfer,
-                VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                cm.indices.data(), cm.indices.size() * sizeof(uint32_t));
-            mGPUMeshes.push_back(std::move(gpu));
+            mModelData.meshes.push_back(std::move(cubeData.meshes[0]));
         }
 
         auto pushMat = [&](glm::vec3 color, float metallic, float roughness, uint32_t baseTexIdx) {
@@ -302,8 +315,10 @@ void Application::LoadScene() {
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         mGPUMaterials.data(), mGPUMaterials.size() * sizeof(GPUMaterialData));
 
+    mMeshPool.Upload(allocator, mTransfer, mModelData.meshes);
+
     LOG_INFO("Scene loaded: {} meshes, {} textures, {} materials, {} entities",
-             mGPUMeshes.size(), mGPUTextures.size(), mGPUMaterials.size(),
+             mMeshPool.GetMeshCount(), mGPUTextures.size(), mGPUMaterials.size(),
              mRegistry.EntityCount());
 }
 
@@ -317,13 +332,13 @@ void Application::CreateDepthBuffer() {
 }
 
 // =======================================================================
-// Frame descriptors (set 1: 6 bindings -- UBO + SSBO + shadow + IBL)
+// Frame descriptors (set 1: 7 bindings -- UBO + mat SSBO + shadow + IBL + object SSBO)
 // =======================================================================
 void Application::CreateFrameDescriptors() {
     auto device     = mDevice.GetHandle();
     uint32_t frames = FRAMES_IN_FLIGHT;
 
-    VkDescriptorSetLayoutBinding bindings[6]{};
+    VkDescriptorSetLayoutBinding bindings[7]{};
     bindings[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
@@ -336,16 +351,18 @@ void Application::CreateFrameDescriptors() {
                    VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     bindings[5] = {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
                    VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    bindings[6] = {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                   VK_SHADER_STAGE_VERTEX_BIT, nullptr};
 
     VkDescriptorSetLayoutCreateInfo layoutCI{};
     layoutCI.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutCI.bindingCount = 6;
+    layoutCI.bindingCount = 7;
     layoutCI.pBindings    = bindings;
     VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutCI, nullptr, &mFrameSetLayout));
 
     VkDescriptorPoolSize poolSizes[] = {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         frames },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         frames },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         frames * 2 },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, frames * 4 },
     };
     VkDescriptorPoolCreateInfo poolCI{};
@@ -405,7 +422,7 @@ void Application::CreateFrameDescriptors() {
         vkUpdateDescriptorSets(device, 6, writes, 0, nullptr);
     }
 
-    LOG_INFO("Frame descriptors created ({} sets, 6 bindings each)", frames);
+    LOG_INFO("Frame descriptors created ({} sets, 7 bindings each)", frames);
 }
 
 // =======================================================================
@@ -587,14 +604,215 @@ void Application::CreatePipelines() {
         VK_CHECK(vkCreateGraphicsPipelines(device, mPipelines.GetCache(), 1, &ci, nullptr, &mShadowPipeline));
     }
 
-    LOG_INFO("Pipelines created (PBR + Shadow)");
+    // -------- PBR indirect pipeline --------
+    {
+        VkShaderModule vert = mShaders.GetOrLoad("shaders/pbr_indirect.vert.spv");
+        VkShaderModule frag = mShaders.GetOrLoad("shaders/pbr_indirect.frag.spv");
+
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                     VK_SHADER_STAGE_VERTEX_BIT, vert, "main", nullptr};
+        stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                     VK_SHADER_STAGE_FRAGMENT_BIT, frag, "main", nullptr};
+
+        VkPipelineRasterizationStateCreateInfo rasterizer{};
+        rasterizer.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizer.cullMode    = VK_CULL_MODE_BACK_BIT;
+        rasterizer.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterizer.lineWidth   = 1.0f;
+
+        VkPipelineDepthStencilStateCreateInfo depthStencilI{};
+        depthStencilI.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depthStencilI.depthTestEnable  = VK_TRUE;
+        depthStencilI.depthWriteEnable = VK_TRUE;
+        depthStencilI.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+        VkPipelineColorBlendAttachmentState blendAttI{};
+        blendAttI.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                   VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+        VkPipelineColorBlendStateCreateInfo colorBlendI{};
+        colorBlendI.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlendI.attachmentCount = 1;
+        colorBlendI.pAttachments    = &blendAttI;
+
+        VkDescriptorSetLayout setLayoutsI[] = { mDescriptors.GetLayout(), mFrameSetLayout };
+
+        VkPipelineLayoutCreateInfo layoutCII{};
+        layoutCII.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layoutCII.setLayoutCount = 2;
+        layoutCII.pSetLayouts    = setLayoutsI;
+        VK_CHECK(vkCreatePipelineLayout(device, &layoutCII, nullptr, &mPBRIndirectPipelineLayout));
+
+        VkFormat colorFormatI = mSwapchain.GetImageFormat();
+        VkPipelineRenderingCreateInfo renderInfoI{};
+        renderInfoI.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+        renderInfoI.colorAttachmentCount    = 1;
+        renderInfoI.pColorAttachmentFormats = &colorFormatI;
+        renderInfoI.depthAttachmentFormat   = VK_FORMAT_D32_SFLOAT;
+
+        VkGraphicsPipelineCreateInfo ciI{};
+        ciI.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        ciI.pNext               = &renderInfoI;
+        ciI.stageCount          = 2;
+        ciI.pStages             = stages;
+        ciI.pVertexInputState   = &vertexInput;
+        ciI.pInputAssemblyState = &inputAssembly;
+        ciI.pViewportState      = &viewportState;
+        ciI.pRasterizationState = &rasterizer;
+        ciI.pMultisampleState   = &multisampling;
+        ciI.pDepthStencilState  = &depthStencilI;
+        ciI.pColorBlendState    = &colorBlendI;
+        ciI.pDynamicState       = &dynamicState;
+        ciI.layout              = mPBRIndirectPipelineLayout;
+
+        VK_CHECK(vkCreateGraphicsPipelines(device, mPipelines.GetCache(), 1, &ciI, nullptr, &mPBRIndirectPipeline));
+    }
+
+    // -------- Depth pre-pass pipeline (for occluder draw) --------
+    {
+        VkShaderModule vert = mShaders.GetOrLoad("shaders/pbr_indirect.vert.spv");
+        VkShaderModule frag = mShaders.GetOrLoad("shaders/depth_prepass.frag.spv");
+
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                     VK_SHADER_STAGE_VERTEX_BIT, vert, "main", nullptr};
+        stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                     VK_SHADER_STAGE_FRAGMENT_BIT, frag, "main", nullptr};
+
+        VkPipelineRasterizationStateCreateInfo rasterizer{};
+        rasterizer.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizer.cullMode    = VK_CULL_MODE_BACK_BIT;
+        rasterizer.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterizer.lineWidth   = 1.0f;
+
+        VkPipelineDepthStencilStateCreateInfo depthStencilDP{};
+        depthStencilDP.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depthStencilDP.depthTestEnable  = VK_TRUE;
+        depthStencilDP.depthWriteEnable = VK_TRUE;
+        depthStencilDP.depthCompareOp   = VK_COMPARE_OP_LESS;
+
+        VkPipelineColorBlendStateCreateInfo colorBlendDP{};
+        colorBlendDP.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlendDP.attachmentCount = 0;
+
+        VkDescriptorSetLayout setLayoutsDP[] = { mDescriptors.GetLayout(), mFrameSetLayout };
+        VkPipelineLayoutCreateInfo layoutCIDP{};
+        layoutCIDP.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layoutCIDP.setLayoutCount = 2;
+        layoutCIDP.pSetLayouts    = setLayoutsDP;
+        VK_CHECK(vkCreatePipelineLayout(device, &layoutCIDP, nullptr, &mDepthPrepassPipelineLayout));
+
+        VkPipelineRenderingCreateInfo renderInfoDP{};
+        renderInfoDP.sType                = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+        renderInfoDP.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+
+        VkGraphicsPipelineCreateInfo ciDP{};
+        ciDP.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        ciDP.pNext               = &renderInfoDP;
+        ciDP.stageCount          = 2;
+        ciDP.pStages             = stages;
+        ciDP.pVertexInputState   = &vertexInput;
+        ciDP.pInputAssemblyState = &inputAssembly;
+        ciDP.pViewportState      = &viewportState;
+        ciDP.pRasterizationState = &rasterizer;
+        ciDP.pMultisampleState   = &multisampling;
+        ciDP.pDepthStencilState  = &depthStencilDP;
+        ciDP.pColorBlendState    = &colorBlendDP;
+        ciDP.pDynamicState       = &dynamicState;
+        ciDP.layout              = mDepthPrepassPipelineLayout;
+
+        VK_CHECK(vkCreateGraphicsPipelines(device, mPipelines.GetCache(), 1, &ciDP, nullptr, &mDepthPrepassPipeline));
+    }
+
+    // -------- Shadow indirect pipeline --------
+    {
+        VkShaderModule vert = mShaders.GetOrLoad("shaders/shadow_indirect.vert.spv");
+        VkShaderModule frag = mShaders.GetOrLoad("shaders/shadow.frag.spv");
+
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                     VK_SHADER_STAGE_VERTEX_BIT, vert, "main", nullptr};
+        stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                     VK_SHADER_STAGE_FRAGMENT_BIT, frag, "main", nullptr};
+
+        VkPipelineRasterizationStateCreateInfo rasterizer{};
+        rasterizer.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizer.polygonMode             = VK_POLYGON_MODE_FILL;
+        rasterizer.cullMode                = VK_CULL_MODE_FRONT_BIT;
+        rasterizer.frontFace               = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterizer.lineWidth               = 1.0f;
+        rasterizer.depthBiasEnable         = VK_TRUE;
+        rasterizer.depthBiasConstantFactor = 1.25f;
+        rasterizer.depthBiasSlopeFactor    = 1.75f;
+
+        VkPipelineDepthStencilStateCreateInfo depthStencilS{};
+        depthStencilS.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depthStencilS.depthTestEnable  = VK_TRUE;
+        depthStencilS.depthWriteEnable = VK_TRUE;
+        depthStencilS.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+        VkPipelineColorBlendStateCreateInfo colorBlendS{};
+        colorBlendS.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlendS.attachmentCount = 0;
+
+        VkDescriptorSetLayoutBinding shadowIndBinding{};
+        shadowIndBinding.binding         = 0;
+        shadowIndBinding.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        shadowIndBinding.descriptorCount = 1;
+        shadowIndBinding.stageFlags      = VK_SHADER_STAGE_VERTEX_BIT;
+
+        VkDescriptorSetLayoutCreateInfo shadowIndLayoutCI{};
+        shadowIndLayoutCI.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        shadowIndLayoutCI.bindingCount = 1;
+        shadowIndLayoutCI.pBindings    = &shadowIndBinding;
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &shadowIndLayoutCI, nullptr, &mShadowIndirectDescLayout));
+
+        VkPushConstantRange pushRangeS{};
+        pushRangeS.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        pushRangeS.offset     = 0;
+        pushRangeS.size       = sizeof(glm::mat4);
+
+        VkPipelineLayoutCreateInfo layoutCIS{};
+        layoutCIS.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layoutCIS.setLayoutCount         = 1;
+        layoutCIS.pSetLayouts            = &mShadowIndirectDescLayout;
+        layoutCIS.pushConstantRangeCount = 1;
+        layoutCIS.pPushConstantRanges    = &pushRangeS;
+        VK_CHECK(vkCreatePipelineLayout(device, &layoutCIS, nullptr, &mShadowIndirectPipelineLayout));
+
+        VkPipelineRenderingCreateInfo renderInfoS{};
+        renderInfoS.sType                = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+        renderInfoS.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+
+        VkGraphicsPipelineCreateInfo ciS{};
+        ciS.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        ciS.pNext               = &renderInfoS;
+        ciS.stageCount          = 2;
+        ciS.pStages             = stages;
+        ciS.pVertexInputState   = &vertexInput;
+        ciS.pInputAssemblyState = &inputAssembly;
+        ciS.pViewportState      = &viewportState;
+        ciS.pRasterizationState = &rasterizer;
+        ciS.pMultisampleState   = &multisampling;
+        ciS.pDepthStencilState  = &depthStencilS;
+        ciS.pColorBlendState    = &colorBlendS;
+        ciS.pDynamicState       = &dynamicState;
+        ciS.layout              = mShadowIndirectPipelineLayout;
+
+        VK_CHECK(vkCreateGraphicsPipelines(device, mPipelines.GetCache(), 1, &ciS, nullptr, &mShadowIndirectPipeline));
+    }
+
+    LOG_INFO("Pipelines created (PBR + Shadow + Indirect variants)");
 }
 
 // =======================================================================
 // Main loop
 // =======================================================================
 void Application::MainLoop() {
-    LOG_INFO("Entering main loop (Phase 5 — Render Graph)");
+    LOG_INFO("Entering main loop (Phase 6 - GPU-Driven Rendering)");
     while (!mWindow.ShouldClose()) {
         mWindow.PollEvents();
 
@@ -709,6 +927,32 @@ void Application::BuildAndExecuteRenderGraph(VkCommandBuffer cmd, uint32_t image
     constexpr uint32_t CC = CascadedShadowMap::CASCADE_COUNT;
     VkExtent2D extent = mSwapchain.GetExtent();
 
+    bool useGPU       = mGPUDriven && mIndirectRenderer.GetDrawCount() > 0;
+    bool useOcclusion = useGPU && mOcclusionCulling;
+
+    CullParams cullParams{};
+    if (useGPU) {
+        float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+        glm::mat4 view = mCamera.GetViewMatrix();
+        glm::mat4 proj = mCamera.GetProjectionMatrix(aspect);
+        glm::mat4 viewProj = proj * view;
+
+        cullParams.viewProjection = viewProj;
+        ExtractFrustumPlanes(viewProj, cullParams.frustumPlanes);
+        cullParams.hiZSize        = glm::vec2(float(mHiZBuffer.GetWidth()), float(mHiZBuffer.GetHeight()));
+        cullParams.nearPlane      = mCamera.GetNear();
+        cullParams.farPlane       = mCamera.GetFar();
+        cullParams.drawCount      = mIndirectRenderer.GetDrawCount();
+        cullParams.occluderCount  = useOcclusion ? mIndirectRenderer.GetOccluderCount()
+                                                 : mIndirectRenderer.GetDrawCount();
+        cullParams.candidateCount = 0;
+
+        if (mFrameNumber == 0)
+            LOG_INFO("Culling: {} draws, {} occluders (ratio {}), occlusion {}",
+                     cullParams.drawCount, cullParams.occluderCount, mOccluderRatio,
+                     useOcclusion ? "ON" : "OFF");
+    }
+
     mRenderGraph.BeginFrame(mFrameNumber);
 
     // ----- 1. Resources -----
@@ -726,27 +970,208 @@ void Application::BuildAndExecuteRenderGraph(VkCommandBuffer cmd, uint32_t image
         VK_IMAGE_LAYOUT_UNDEFINED,
         VK_IMAGE_ASPECT_DEPTH_BIT);
 
-    // ----- 2. Passes (each wires its own resource access + dependencies in Setup) -----
-    auto shadowPass = mRenderGraph.AddPass(std::make_unique<ShadowPass>(ShadowPass::Desc{
-        csmRes, &mCSM, mShadowPipeline, mShadowPipelineLayout, &mRegistry, &mGPUMeshes
-    }));
+    // ----- 2. Passes -----
 
-    auto forwardPass = mRenderGraph.AddPass(std::make_unique<ForwardPass>(ForwardPass::Desc{
-        csmRes, depthRes, swapRes, shadowPass,
-        extent, mSwapchain.GetImageViews()[imageIndex], mDepthImage.GetView(),
-        mPBRPipeline, mPBRPipelineLayout,
-        mDescriptors.GetSet(), mFrameDescSets[mFrameIndex],
-        &mRegistry, &mGPUMeshes, &mGPUMaterials
-    }));
+    RenderGraph::PassHandle frustumCullPassH   = RenderGraph::INVALID_PASS;
+    RenderGraph::PassHandle occlusionTestPassH = RenderGraph::INVALID_PASS;
+
+    if (useGPU) {
+        FrustumCullPass::Desc fcDesc{};
+        fcDesc.culling = &mComputeCulling;
+        fcDesc.params  = &cullParams;
+        frustumCullPassH = mRenderGraph.AddPass(std::make_unique<FrustumCullPass>(fcDesc));
+
+        if (useOcclusion) {
+            OccluderDepthPass::Desc odDesc{};
+            odDesc.depthResource         = depthRes;
+            odDesc.frustumCullPassHandle = frustumCullPassH;
+            odDesc.extent                = extent;
+            odDesc.depthView             = mDepthImage.GetView();
+            odDesc.pipeline              = mDepthPrepassPipeline;
+            odDesc.pipelineLayout        = mDepthPrepassPipelineLayout;
+            odDesc.bindlessSet           = mDescriptors.GetSet();
+            odDesc.frameDescSet          = mFrameDescSets[mFrameIndex];
+            odDesc.meshPool              = &mMeshPool;
+            odDesc.culling               = &mComputeCulling;
+            odDesc.maxDrawCount          = mIndirectRenderer.GetDrawCount();
+            auto occDepthPassH = mRenderGraph.AddPass(std::make_unique<OccluderDepthPass>(odDesc));
+
+            HiZBuildPass::Desc hzDesc{};
+            hzDesc.depthResource           = depthRes;
+            hzDesc.occluderDepthPassHandle = occDepthPassH;
+            hzDesc.hiZ                     = &mHiZBuffer;
+            auto hiZPassH = mRenderGraph.AddPass(std::make_unique<HiZBuildPass>(hzDesc));
+
+            OcclusionTestPass::Desc otDesc{};
+            otDesc.hiZBuildPassHandle = hiZPassH;
+            otDesc.depthResource      = depthRes;
+            otDesc.culling            = &mComputeCulling;
+            otDesc.params             = &cullParams;
+            occlusionTestPassH = mRenderGraph.AddPass(std::make_unique<OcclusionTestPass>(otDesc));
+        }
+    }
+
+    ShadowPass::Desc shadowDesc{};
+    shadowDesc.csmResource   = csmRes;
+    shadowDesc.csm           = &mCSM;
+    shadowDesc.pipeline      = mShadowPipeline;
+    shadowDesc.pipelineLayout = mShadowPipelineLayout;
+    shadowDesc.registry      = &mRegistry;
+    shadowDesc.meshPool      = &mMeshPool;
+    if (useGPU) {
+        shadowDesc.gpuDriven                  = true;
+        shadowDesc.indirectPipeline           = mShadowIndirectPipeline;
+        shadowDesc.indirectPipelineLayout     = mShadowIndirectPipelineLayout;
+        shadowDesc.indirectDescSet            = mShadowIndirectDescSet;
+        shadowDesc.indirectBuffer             = mIndirectRenderer.GetIndirectBuffer();
+        shadowDesc.countBuffer                = mIndirectRenderer.GetCountBuffer();
+        shadowDesc.maxDrawCount               = mIndirectRenderer.GetDrawCount();
+    }
+    auto shadowPassH = mRenderGraph.AddPass(std::make_unique<ShadowPass>(shadowDesc));
+
+    ForwardPass::Desc fwdDesc{};
+    fwdDesc.csmResource        = csmRes;
+    fwdDesc.depthResource      = depthRes;
+    fwdDesc.swapchainResource  = swapRes;
+    fwdDesc.shadowPassHandle   = shadowPassH;
+    fwdDesc.extent             = extent;
+    fwdDesc.swapchainView      = mSwapchain.GetImageViews()[imageIndex];
+    fwdDesc.depthView          = mDepthImage.GetView();
+    fwdDesc.pipeline           = mPBRPipeline;
+    fwdDesc.pipelineLayout     = mPBRPipelineLayout;
+    fwdDesc.bindlessSet        = mDescriptors.GetSet();
+    fwdDesc.frameDescSet       = mFrameDescSets[mFrameIndex];
+    fwdDesc.registry           = &mRegistry;
+    fwdDesc.meshPool           = &mMeshPool;
+    fwdDesc.gpuMaterials       = &mGPUMaterials;
+    if (useGPU) {
+        fwdDesc.gpuDriven                = true;
+        fwdDesc.occlusionEnabled         = useOcclusion;
+        fwdDesc.indirectPipeline         = mPBRIndirectPipeline;
+        fwdDesc.indirectPipelineLayout   = mPBRIndirectPipelineLayout;
+        fwdDesc.occluderBuffer           = mComputeCulling.GetOccluderIndirectBuffer();
+        fwdDesc.occluderCountBuffer      = mComputeCulling.GetOccluderCountBuffer();
+        fwdDesc.maxOccluderCount         = mIndirectRenderer.GetDrawCount();
+        fwdDesc.visibleBuffer            = mComputeCulling.GetVisibleIndirectBuffer();
+        fwdDesc.visibleCountBuffer       = mComputeCulling.GetVisibleCountBuffer();
+        fwdDesc.maxVisibleCount          = mIndirectRenderer.GetDrawCount();
+        fwdDesc.occlusionTestPassHandle  = occlusionTestPassH;
+        fwdDesc.frustumCullPassHandle    = frustumCullPassH;
+    }
+    auto forwardPassH = mRenderGraph.AddPass(std::make_unique<ForwardPass>(fwdDesc));
 
     mRenderGraph.AddPass(std::make_unique<PresentPass>(PresentPass::Desc{
-        swapRes, forwardPass
+        swapRes, forwardPassH
     }));
 
     // ----- 3. Compile & execute -----
     mRenderGraph.Compile();
     mRenderGraph.Execute(cmd);
 }
+
+// =======================================================================
+// GPU-Driven rendering init/shutdown
+// =======================================================================
+void Application::InitGPUDriven() {
+    auto device    = mDevice.GetHandle();
+    auto allocator = mMemory.GetAllocator();
+
+    if (!mGPUDriven || mMeshPool.GetMeshCount() == 0) {
+        mGPUDriven = false;
+        return;
+    }
+
+    mIndirectRenderer.Initialize(allocator, device);
+    mRegistry.UpdateTransforms();
+    mIndirectRenderer.BuildCommands(allocator, mTransfer, mMeshPool, mRegistry, mOccluderRatio);
+
+    mHiZBuffer.Initialize(device, allocator, mShaders);
+    auto extent = mSwapchain.GetExtent();
+    mHiZBuffer.Resize(device, allocator, extent.width, extent.height);
+    mHiZBuffer.SetSourceDepth(mDepthImage.GetView());
+
+    mComputeCulling.Initialize(device, allocator, mShaders);
+    mComputeCulling.UpdateBuffers(allocator,
+        mIndirectRenderer.GetIndirectBuffer(),
+        mIndirectRenderer.GetDrawCount(),
+        mIndirectRenderer.GetObjectBuffer(),
+        mHiZBuffer.GetView(),
+        mHiZBuffer.GetSampler());
+
+    // Object SSBO descriptor for frame sets (binding 6)
+    if (mIndirectRenderer.GetObjectBuffer() != VK_NULL_HANDLE) {
+        for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; i++) {
+            VkDescriptorBufferInfo objInfo{mIndirectRenderer.GetObjectBuffer(), 0, VK_WHOLE_SIZE};
+            VkWriteDescriptorSet write{};
+            write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet          = mFrameDescSets[i];
+            write.dstBinding      = 6;
+            write.descriptorCount = 1;
+            write.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            write.pBufferInfo     = &objInfo;
+            vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+        }
+    }
+
+    // Shadow indirect descriptor set
+    {
+        VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+        VkDescriptorPoolCreateInfo poolCI{};
+        poolCI.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolCI.maxSets       = 1;
+        poolCI.poolSizeCount = 1;
+        poolCI.pPoolSizes    = &poolSize;
+        VK_CHECK(vkCreateDescriptorPool(device, &poolCI, nullptr, &mShadowIndirectDescPool));
+
+        VkDescriptorSetAllocateInfo allocCI{};
+        allocCI.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocCI.descriptorPool     = mShadowIndirectDescPool;
+        allocCI.descriptorSetCount = 1;
+        allocCI.pSetLayouts        = &mShadowIndirectDescLayout;
+        VK_CHECK(vkAllocateDescriptorSets(device, &allocCI, &mShadowIndirectDescSet));
+
+        VkDescriptorBufferInfo objInfo{mIndirectRenderer.GetObjectBuffer(), 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet write{};
+        write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet          = mShadowIndirectDescSet;
+        write.dstBinding      = 0;
+        write.descriptorCount = 1;
+        write.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo     = &objInfo;
+        vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+    }
+
+    LOG_INFO("GPU-Driven rendering initialized ({} indirect draws)", mIndirectRenderer.GetDrawCount());
+}
+
+void Application::ShutdownGPUDriven() {
+    auto device    = mDevice.GetHandle();
+    auto allocator = mMemory.GetAllocator();
+
+    mComputeCulling.Shutdown(device, allocator);
+    mHiZBuffer.Shutdown(device, allocator);
+    mIndirectRenderer.Shutdown(allocator);
+
+    if (mShadowIndirectDescPool) { vkDestroyDescriptorPool(device, mShadowIndirectDescPool, nullptr); mShadowIndirectDescPool = VK_NULL_HANDLE; }
+}
+
+// =======================================================================
+// Compute culling
+// =======================================================================
+void Application::ExtractFrustumPlanes(const glm::mat4& vp, glm::vec4 planes[6]) {
+    planes[0] = glm::vec4(vp[0][3] + vp[0][0], vp[1][3] + vp[1][0], vp[2][3] + vp[2][0], vp[3][3] + vp[3][0]); // left
+    planes[1] = glm::vec4(vp[0][3] - vp[0][0], vp[1][3] - vp[1][0], vp[2][3] - vp[2][0], vp[3][3] - vp[3][0]); // right
+    planes[2] = glm::vec4(vp[0][3] + vp[0][1], vp[1][3] + vp[1][1], vp[2][3] + vp[2][1], vp[3][3] + vp[3][1]); // bottom
+    planes[3] = glm::vec4(vp[0][3] - vp[0][1], vp[1][3] - vp[1][1], vp[2][3] - vp[2][1], vp[3][3] - vp[3][1]); // top
+    planes[4] = glm::vec4(vp[0][3] + vp[0][2], vp[1][3] + vp[1][2], vp[2][3] + vp[2][2], vp[3][3] + vp[3][2]); // near
+    planes[5] = glm::vec4(vp[0][3] - vp[0][2], vp[1][3] - vp[1][2], vp[2][3] - vp[2][2], vp[3][3] - vp[3][2]); // far
+
+    for (int i = 0; i < 6; i++) {
+        float len = glm::length(glm::vec3(planes[i]));
+        planes[i] /= len;
+    }
+}
+
 
 // =======================================================================
 // Swapchain recreation
@@ -766,6 +1191,12 @@ void Application::RecreateSwapchain() {
                         mSurface, mWindow.GetHandle(), mDevice.GetQueueFamilyIndices());
     CreateDepthBuffer();
 
+    if (mGPUDriven) {
+        auto extent = mSwapchain.GetExtent();
+        mHiZBuffer.Resize(mDevice.GetHandle(), mMemory.GetAllocator(), extent.width, extent.height);
+        mHiZBuffer.SetSourceDepth(mDepthImage.GetView());
+    }
+
     LOG_INFO("Swapchain recreated");
 }
 
@@ -778,11 +1209,19 @@ void Application::CleanupVulkan() {
 
     mPipelines.SaveCache("pipeline_cache.bin");
 
-    for (auto& mesh : mGPUMeshes) {
-        mesh.vertexBuffer.Destroy(allocator);
-        mesh.indexBuffer.Destroy(allocator);
+    if (mMultiThreading) {
+        mSubmitThread.Drain();
+        mSubmitThread.Shutdown();
+        for (auto pool : mWorkerCommandPools)
+            if (pool) vkDestroyCommandPool(device, pool, nullptr);
+        mWorkerCommandPools.clear();
+        mSecondaryCommandBuffers.clear();
+        mThreadPool.Shutdown();
     }
-    mGPUMeshes.clear();
+
+    ShutdownGPUDriven();
+
+    mMeshPool.Destroy(allocator);
 
     for (auto& tex : mGPUTextures)
         tex.Destroy(allocator, device);
@@ -820,6 +1259,13 @@ void Application::CleanupVulkan() {
     if (mPBRPipelineLayout)        vkDestroyPipelineLayout(device, mPBRPipelineLayout, nullptr);
     if (mShadowPipeline)           vkDestroyPipeline(device, mShadowPipeline, nullptr);
     if (mShadowPipelineLayout)     vkDestroyPipelineLayout(device, mShadowPipelineLayout, nullptr);
+    if (mPBRIndirectPipeline)      vkDestroyPipeline(device, mPBRIndirectPipeline, nullptr);
+    if (mPBRIndirectPipelineLayout) vkDestroyPipelineLayout(device, mPBRIndirectPipelineLayout, nullptr);
+    if (mShadowIndirectPipeline)       vkDestroyPipeline(device, mShadowIndirectPipeline, nullptr);
+    if (mShadowIndirectPipelineLayout) vkDestroyPipelineLayout(device, mShadowIndirectPipelineLayout, nullptr);
+    if (mShadowIndirectDescLayout)     vkDestroyDescriptorSetLayout(device, mShadowIndirectDescLayout, nullptr);
+    if (mDepthPrepassPipeline)         vkDestroyPipeline(device, mDepthPrepassPipeline, nullptr);
+    if (mDepthPrepassPipelineLayout)   vkDestroyPipelineLayout(device, mDepthPrepassPipelineLayout, nullptr);
 
     mShaders.Shutdown();
     mPipelines.Shutdown();

@@ -9,7 +9,7 @@
 #include <glm/glm.hpp>
 #include <vector>
 
-struct GPUMesh;
+class MeshPool;
 
 class ShadowPass : public RenderPass {
 public:
@@ -19,7 +19,15 @@ public:
         VkPipeline             pipeline;
         VkPipelineLayout       pipelineLayout;
         const Registry*        registry;
-        const std::vector<GPUMesh>* gpuMeshes;
+        const MeshPool*        meshPool                   = nullptr;
+
+        bool                   gpuDriven                  = false;
+        VkPipeline             indirectPipeline           = VK_NULL_HANDLE;
+        VkPipelineLayout       indirectPipelineLayout     = VK_NULL_HANDLE;
+        VkDescriptorSet        indirectDescSet            = VK_NULL_HANDLE;
+        VkBuffer               indirectBuffer             = VK_NULL_HANDLE;
+        VkBuffer               countBuffer                = VK_NULL_HANDLE;
+        uint32_t               maxDrawCount               = 0;
     };
 
     explicit ShadowPass(const Desc& desc);

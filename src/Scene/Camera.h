@@ -36,6 +36,6 @@ private:
     float mFovDeg           = 45.0f;
     float mNear             = 0.1f;
     float mFar              = 150.0f;
-    float mMoveSpeed        = 500.0f;
+    float mMoveSpeed        = 4.0f;
     float mMouseSensitivity = 0.15f;
 };

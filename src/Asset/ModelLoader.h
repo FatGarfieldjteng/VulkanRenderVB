@@ -1,6 +1,7 @@
 #pragma once
 
 #include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -37,10 +38,18 @@ struct MaterialData {
     glm::vec3 emissiveFactor{0.0f};
 };
 
+struct MeshInstance {
+    int       meshIndex = -1;
+    glm::vec3 translation{0.0f};
+    glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
+    glm::vec3 scale{1.0f};
+};
+
 struct ModelData {
     std::vector<MeshData>     meshes;
     std::vector<TextureData>  textures;
     std::vector<MaterialData> materials;
+    std::vector<MeshInstance> instances;
 };
 
 class ModelLoader {
@@ -49,4 +58,6 @@ public:
     static void GenerateProceduralCube(ModelData& outModel);
     static void GenerateGroundPlane(MeshData& outMesh, float halfSize = 20.0f);
     static void ComputeTangents(MeshData& mesh);
+
+    static void SortMeshesByVolume(std::vector<MeshData>& meshes);
 };

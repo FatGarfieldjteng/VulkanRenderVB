@@ -1,4 +1,4 @@
-#version 450
+#version 460
 #extension GL_EXT_nonuniform_qualifier : enable
 
 layout(location = 0) in vec3  fragWorldPos;
@@ -6,6 +6,7 @@ layout(location = 1) in vec3  fragNormal;
 layout(location = 2) in vec2  fragTexCoord;
 layout(location = 3) in float fragViewDepth;
 layout(location = 4) in vec4  fragTangent;
+layout(location = 5) flat in uint fragMaterialIndex;
 
 layout(set = 0, binding = 0) uniform sampler2D textures[];
 
@@ -41,17 +42,10 @@ layout(set = 1, binding = 3) uniform samplerCube irradianceMap;
 layout(set = 1, binding = 4) uniform samplerCube prefilterMap;
 layout(set = 1, binding = 5) uniform sampler2D   brdfLUT;
 
-layout(push_constant) uniform PushConstants {
-    mat4 model;
-    uint materialIndex;
-} pc;
-
 layout(location = 0) out vec4 outColor;
 
 const float PI = 3.14159265359;
 const float MAX_PREFILTER_LOD = 4.0;
-
-// ---- PBR functions ----
 
 float DistributionGGX(vec3 N, vec3 H, float roughness) {
     float a  = roughness * roughness;
@@ -82,8 +76,6 @@ vec3 FresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
     return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
-// ---- Shadow functions ----
-
 float SampleShadowPCF(vec3 worldPos, uint cascade) {
     vec4 lightSpace = frame.cascadeViewProj[cascade] * vec4(worldPos, 1.0);
     vec3 projCoords = lightSpace.xyz / lightSpace.w;
@@ -113,8 +105,6 @@ float ComputeShadow(vec3 worldPos) {
     return SampleShadowPCF(worldPos, cascade);
 }
 
-// ---- Normal mapping ----
-
 vec3 ComputeNormal(MaterialParams mat) {
     vec3 Ng = normalize(fragNormal);
     vec3 T  = fragTangent.xyz;
@@ -131,10 +121,8 @@ vec3 ComputeNormal(MaterialParams mat) {
     return normalize(TBN * normalSample);
 }
 
-// ---- Main ----
-
 void main() {
-    MaterialParams mat = materials[pc.materialIndex];
+    MaterialParams mat = materials[fragMaterialIndex];
 
     vec4 baseColor = mat.baseColorFactor *
         texture(textures[nonuniformEXT(mat.baseColorTexIdx)], fragTexCoord);
@@ -151,7 +139,6 @@ void main() {
     vec3 albedo = baseColor.rgb;
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
 
-    // ---- Direct sunlight (Cook-Torrance) ----
     vec3 L = normalize(-frame.sunDirection.xyz);
     vec3 H = normalize(V + L);
     float NdotL = max(dot(N, L), 0.0);
@@ -168,7 +155,6 @@ void main() {
     vec3 radiance = frame.sunColor.rgb * frame.sunColor.w;
     vec3 Lo = (diffuse + specular) * radiance * NdotL * shadow;
 
-    // ---- IBL ambient ----
     float NdotV = max(dot(N, V), 0.0);
     vec3 F_ibl = FresnelSchlickRoughness(NdotV, F0, roughness);
     vec3 kD_ibl = (1.0 - F_ibl) * (1.0 - metallic);
@@ -183,13 +169,10 @@ void main() {
 
     vec3 ambient = (diffuseIBL + specularIBL) * ao;
 
-    // ---- Emissive ----
     vec3 emissive = texture(textures[nonuniformEXT(mat.emissiveTexIdx)], fragTexCoord).rgb;
 
-    // ---- Final ----
     vec3 color = ambient + Lo + emissive;
 
-    // Reinhard tonemapping (sRGB swapchain handles gamma)
     color = color / (color + vec3(1.0));
 
     outColor = vec4(color, baseColor.a);

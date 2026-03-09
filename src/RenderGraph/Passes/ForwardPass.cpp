@@ -1,4 +1,5 @@
 #include "RenderGraph/Passes/ForwardPass.h"
+#include "RHI/VulkanUtils.h"
 #include "GPU/MeshPool.h"
 
 #include <algorithm>
@@ -17,7 +18,7 @@ void ForwardPass::Setup(RenderGraph& graph, PassHandle self) {
     graph.Write(self, mDesc.depthResource, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                 VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
-    graph.Write(self, mDesc.swapchainResource, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    graph.Write(self, mDesc.colorResource, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
@@ -32,22 +33,54 @@ void ForwardPass::Setup(RenderGraph& graph, PassHandle self) {
 }
 
 void ForwardPass::Execute(VkCommandBuffer cmd) {
+    const bool msaa = mDesc.msaaSamples != VK_SAMPLE_COUNT_1_BIT
+                   && mDesc.msaaColorView != VK_NULL_HANDLE;
+
+    if (msaa) {
+        TransitionImage(cmd, mDesc.msaaColorImage,
+                        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+        TransitionImage(cmd, mDesc.msaaDepthImage,
+                        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                        VK_IMAGE_ASPECT_DEPTH_BIT);
+    }
+
     VkRenderingAttachmentInfo colorAtt{};
     colorAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    colorAtt.imageView   = mDesc.swapchainView;
+    colorAtt.imageView   = msaa ? mDesc.msaaColorView : mDesc.colorView;
     colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colorAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAtt.storeOp     = msaa ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
     colorAtt.clearValue.color = {{0.02f, 0.02f, 0.04f, 1.0f}};
+
+    if (msaa) {
+        colorAtt.resolveMode       = VK_RESOLVE_MODE_AVERAGE_BIT;
+        colorAtt.resolveImageView  = mDesc.resolveColorView;
+        colorAtt.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    }
 
     VkRenderingAttachmentInfo depthAtt{};
     depthAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    depthAtt.imageView   = mDesc.depthView;
+    depthAtt.imageView   = msaa ? mDesc.msaaDepthView : mDesc.depthView;
     depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    depthAtt.loadOp      = (mDesc.gpuDriven && mDesc.occlusionEnabled)
-                         ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+    depthAtt.storeOp     = msaa ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
     depthAtt.clearValue.depthStencil = {1.0f, 0};
+
+    if (msaa) {
+        depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAtt.resolveMode       = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+        depthAtt.resolveImageView  = mDesc.resolveDepthView;
+        depthAtt.resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    } else {
+        depthAtt.loadOp = (mDesc.gpuDriven && mDesc.occlusionEnabled)
+                        ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+    }
 
     VkRenderingInfo ri{};
     ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;

@@ -1,0 +1,39 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D srcTexture;
+layout(set = 0, binding = 1, rgba16f) uniform image2D dstTexture;
+
+layout(push_constant) uniform Params {
+    vec2  srcTexelSize;
+    uvec2 dstSize;
+    float filterRadius;
+};
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(dstSize.x) || coord.y >= int(dstSize.y))
+        return;
+
+    vec2 uv = (vec2(coord) + 0.5) / vec2(dstSize);
+
+    // 9-tap tent filter for upsampling
+    float r = filterRadius;
+    vec3 a = texture(srcTexture, uv + vec2(-r, -r) * srcTexelSize).rgb;
+    vec3 b = texture(srcTexture, uv + vec2( 0, -r) * srcTexelSize).rgb;
+    vec3 c = texture(srcTexture, uv + vec2( r, -r) * srcTexelSize).rgb;
+    vec3 d = texture(srcTexture, uv + vec2(-r,  0) * srcTexelSize).rgb;
+    vec3 e = texture(srcTexture, uv                               ).rgb;
+    vec3 f = texture(srcTexture, uv + vec2( r,  0) * srcTexelSize).rgb;
+    vec3 g = texture(srcTexture, uv + vec2(-r,  r) * srcTexelSize).rgb;
+    vec3 h = texture(srcTexture, uv + vec2( 0,  r) * srcTexelSize).rgb;
+    vec3 i = texture(srcTexture, uv + vec2( r,  r) * srcTexelSize).rgb;
+
+    vec3 upsample = e * 0.25
+                  + (b + d + f + h) * 0.125
+                  + (a + c + g + i) * 0.0625;
+
+    vec3 existing = imageLoad(dstTexture, coord).rgb;
+    imageStore(dstTexture, coord, vec4(existing + upsample, 1.0));
+}

@@ -1,0 +1,44 @@
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D hdrColor;
+layout(std430, set = 0, binding = 1) buffer HistogramSSBO {
+    uint bins[256];
+};
+
+layout(push_constant) uniform Params {
+    float minLogLum;
+    float invLogLumRange;
+    uvec2 inputSize;
+};
+
+shared uint sharedBins[256];
+
+void main() {
+    uint localIdx = gl_LocalInvocationIndex;
+    if (localIdx < 256)
+        sharedBins[localIdx] = 0;
+    barrier();
+
+    uvec2 coord = gl_GlobalInvocationID.xy;
+    if (coord.x < inputSize.x && coord.y < inputSize.y) {
+        vec2 uv = (vec2(coord) + 0.5) / vec2(inputSize);
+        vec3 color = texture(hdrColor, uv).rgb;
+        float lum = dot(color, vec3(0.2126, 0.7152, 0.0722));
+
+        uint bin;
+        if (lum < 1e-5)
+            bin = 0;
+        else {
+            float logLum = clamp((log2(lum) - minLogLum) * invLogLumRange, 0.0, 1.0);
+            bin = uint(logLum * 254.0 + 1.0);
+        }
+        atomicAdd(sharedBins[bin], 1);
+    }
+
+    barrier();
+
+    if (localIdx < 256)
+        atomicAdd(bins[localIdx], sharedBins[localIdx]);
+}

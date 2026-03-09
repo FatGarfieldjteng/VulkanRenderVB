@@ -1,0 +1,95 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D depthTex;
+layout(set = 0, binding = 1, r8) writeonly uniform image2D aoOutput;
+
+layout(push_constant) uniform Params {
+    mat4  invProjection;
+    vec4  projInfo;       // x: 2/(w*P00), y: 2/(h*P11), z: -(1-P02)/P00, w: -(1+P12)/P11
+    vec2  noiseScale;
+    float radius;
+    float bias;
+    float intensity;
+    float farPlane;
+    uvec2 resolution;
+};
+
+const int DIRECTION_COUNT = 4;
+const int STEP_COUNT = 4;
+
+const float PI = 3.14159265359;
+
+float LinearizeDepth(float d) {
+    vec4 clip = vec4(0.0, 0.0, d, 1.0);
+    vec4 view = invProjection * clip;
+    return -view.z / view.w;
+}
+
+vec3 GetViewPos(ivec2 coord) {
+    float depth = texelFetch(depthTex, coord, 0).r;
+    float z = LinearizeDepth(depth);
+    vec2 pixelCenter = vec2(coord) + 0.5;
+    vec3 viewPos;
+    viewPos.x = (pixelCenter.x * projInfo.x + projInfo.z) * z;
+    viewPos.y = (pixelCenter.y * projInfo.y + projInfo.w) * z;
+    viewPos.z = -z;
+    return viewPos;
+}
+
+float InterleavedGradientNoise(vec2 coord) {
+    return fract(52.9829189 * fract(0.06711056 * coord.x + 0.00583715 * coord.y));
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(resolution.x) || coord.y >= int(resolution.y))
+        return;
+
+    vec3 P = GetViewPos(coord);
+
+    if (-P.z >= farPlane * 0.99) {
+        imageStore(aoOutput, coord, vec4(1.0));
+        return;
+    }
+
+    ivec2 dxCoord = clamp(coord + ivec2(1, 0), ivec2(0), ivec2(resolution) - 1);
+    ivec2 dyCoord = clamp(coord + ivec2(0, 1), ivec2(0), ivec2(resolution) - 1);
+    vec3 dPdx = GetViewPos(dxCoord) - P;
+    vec3 dPdy = GetViewPos(dyCoord) - P;
+    vec3 N = normalize(cross(dPdy, dPdx));
+
+    float noise = InterleavedGradientNoise(vec2(coord));
+    float rotAngle = noise * PI;
+
+    float viewRadius = radius * abs(P.z) * projInfo.x;
+
+    float ao = 0.0;
+    for (int d = 0; d < DIRECTION_COUNT; d++) {
+        float angle = (float(d) + noise) / float(DIRECTION_COUNT) * PI;
+        vec2 dir = vec2(cos(angle + rotAngle), sin(angle + rotAngle));
+
+        float maxHorizon = -1.0;
+        for (int s = 1; s <= STEP_COUNT; s++) {
+            vec2 offset = dir * (float(s) / float(STEP_COUNT)) * radius;
+            ivec2 sampleCoord = coord + ivec2(offset);
+            sampleCoord = clamp(sampleCoord, ivec2(0), ivec2(resolution) - 1);
+
+            vec3 S = GetViewPos(sampleCoord);
+            vec3 diff = S - P;
+            float dist = length(diff);
+            if (dist < 1e-4) continue;
+
+            float sinH = dot(diff, N) / dist;
+            float falloff = clamp(1.0 - dist * dist / (viewRadius * viewRadius), 0.0, 1.0);
+            maxHorizon = max(maxHorizon, (sinH - bias) * falloff);
+        }
+        ao += max(0.0, maxHorizon);
+    }
+
+    ao = 1.0 - (ao / float(DIRECTION_COUNT)) * intensity;
+    ao = clamp(ao, 0.0, 1.0);
+
+    imageStore(aoOutput, coord, vec4(ao));
+}

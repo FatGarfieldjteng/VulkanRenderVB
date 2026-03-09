@@ -28,6 +28,7 @@
 #include "GPU/IndirectRenderer.h"
 #include "GPU/HiZBuffer.h"
 #include "GPU/ComputeCulling.h"
+#include "PostProcess/PostProcessStack.h"
 #include "VisualUI/DebugUI.h"
 #include "VisualUI/GPUProfiler.h"
 #include "VisualUI/DebugVisualization.h"
@@ -151,6 +152,14 @@ private:
     VkDescriptorSetLayout mShadowIndirectDescLayout = VK_NULL_HANDLE;
     VkDescriptorPool      mShadowIndirectDescPool   = VK_NULL_HANDLE;
     VkDescriptorSet       mShadowIndirectDescSet    = VK_NULL_HANDLE;
+
+    // --- Post-processing (Phase 8) ---
+    PostProcessStack mPostProcess;
+
+    // --- MSAA ---
+    std::vector<VkSampleCountFlagBits> mSupportedMSAA;
+    VkSampleCountFlagBits mCurrentMSAA = VK_SAMPLE_COUNT_1_BIT;
+    void RecreatePBRPipelines(VkSampleCountFlagBits samples);
 
     // --- Visual UI (Phase 7) ---
     DebugUI              mDebugUI;

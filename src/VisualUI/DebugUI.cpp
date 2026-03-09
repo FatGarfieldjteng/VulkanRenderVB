@@ -1,6 +1,7 @@
 #include "VisualUI/DebugUI.h"
 #include "VisualUI/GPUProfiler.h"
 #include "VisualUI/PipelineStatistics.h"
+#include "PostProcess/PostProcessStack.h"
 #include "Scene/ECS.h"
 #include "Scene/Scene.h"
 #include "Core/Logger.h"
@@ -110,17 +111,21 @@ void DebugUI::BeginFrame() {
 }
 
 void DebugUI::BuildUI(float deltaTime, const GPUProfiler* profiler, const PipelineStatistics* pipeStats,
-                      Registry* registry, std::vector<GPUMaterialData>* materials) {
+                      Registry* registry, std::vector<GPUMaterialData>* materials,
+                      PostProcessSettings* ppSettings,
+                      const std::vector<VkSampleCountFlagBits>* supportedMSAA) {
     ImGuiID dockID = ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(),
                                                     ImGuiDockNodeFlags_PassthruCentralNode);
     (void)dockID;
 
     DrawMainMenuBar();
-    DrawRenderSettingsPanel(deltaTime);
+    DrawRenderSettingsPanel(deltaTime, supportedMSAA);
     DrawSceneHierarchyPanel(registry);
     DrawMaterialEditorPanel(materials);
     DrawProfilerPanel(profiler);
     DrawPipelineStatsPanel(pipeStats);
+    DrawPostProcessPanel(ppSettings);
+    DrawToneMappingPanel(ppSettings);
 
     if (mState.showDemoWindow)
         ImGui::ShowDemoWindow(&mState.showDemoWindow);
@@ -168,7 +173,7 @@ void DebugUI::DrawMainMenuBar() {
     }
 }
 
-void DebugUI::DrawRenderSettingsPanel(float deltaTime) {
+void DebugUI::DrawRenderSettingsPanel(float deltaTime, const std::vector<VkSampleCountFlagBits>* supportedMSAA) {
     float fps = (deltaTime > 0.0f) ? 1.0f / deltaTime : 0.0f;
 
     constexpr float smoothAlpha = 0.05f;
@@ -191,6 +196,36 @@ void DebugUI::DrawRenderSettingsPanel(float deltaTime) {
 
     ImGui::Separator();
     ImGui::Checkbox("Pipeline Statistics", &mState.pipelineStatsEnabled);
+
+    if (supportedMSAA && !supportedMSAA->empty()) {
+        ImGui::Separator();
+        ImGui::Text("Anti-Aliasing");
+
+        auto sampleCountLabel = [](VkSampleCountFlagBits s) -> const char* {
+            switch (s) {
+                case VK_SAMPLE_COUNT_1_BIT: return "Off (1x)";
+                case VK_SAMPLE_COUNT_2_BIT: return "2x";
+                case VK_SAMPLE_COUNT_4_BIT: return "4x";
+                case VK_SAMPLE_COUNT_8_BIT: return "8x";
+                default: return "?";
+            }
+        };
+
+        const char* preview = sampleCountLabel((*supportedMSAA)[mState.msaaIndex]);
+        if (ImGui::BeginCombo("MSAA", preview)) {
+            for (int i = 0; i < static_cast<int>(supportedMSAA->size()); i++) {
+                bool selected = (i == mState.msaaIndex);
+                if (ImGui::Selectable(sampleCountLabel((*supportedMSAA)[i]), selected)) {
+                    if (i != mState.msaaIndex) {
+                        mState.msaaIndex = i;
+                        mState.msaaChanged = true;
+                    }
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+    }
 
     ImGui::Separator();
     ImGui::Text("Debug Visualization");
@@ -287,6 +322,96 @@ void DebugUI::DrawMaterialEditorPanel(std::vector<GPUMaterialData>* materials) {
         ImGui::SliderFloat("Roughness", &mat.roughnessFactor, 0.0f, 1.0f);
     } else {
         ImGui::Text("Select an entity in the Scene Hierarchy");
+    }
+
+    ImGui::End();
+}
+
+void DebugUI::DrawPostProcessPanel(PostProcessSettings* settings) {
+    if (!settings) return;
+
+    ImGui::Begin("Post Processing");
+
+    ImGui::Checkbox("Auto Exposure", &settings->autoExposureEnabled);
+    if (settings->autoExposureEnabled) {
+        ImGui::Indent();
+        ImGui::SliderFloat("Min EV", &settings->exposureMinEV, -20.0f, 0.0f);
+        ImGui::SliderFloat("Max EV", &settings->exposureMaxEV, 0.0f, 30.0f);
+        ImGui::SliderFloat("Adapt Speed", &settings->adaptSpeed, 0.1f, 10.0f);
+        ImGui::Unindent();
+    }
+
+    ImGui::Separator();
+    ImGui::Checkbox("SSAO", &settings->ssaoEnabled);
+    if (settings->ssaoEnabled) {
+        ImGui::Indent();
+        ImGui::SliderFloat("AO Radius", &settings->ssaoRadius, 1.0f, 100.0f);
+        ImGui::SliderFloat("AO Bias", &settings->ssaoBias, 0.0f, 0.5f);
+        ImGui::SliderFloat("AO Intensity", &settings->ssaoIntensity, 0.0f, 5.0f);
+        ImGui::Unindent();
+    }
+
+    ImGui::Separator();
+    ImGui::Checkbox("Bloom", &settings->bloomEnabled);
+    if (settings->bloomEnabled) {
+        ImGui::Indent();
+        ImGui::SliderFloat("Bloom Strength", &settings->bloomStrength, 0.0f, 0.5f);
+        ImGui::Unindent();
+    }
+
+    ImGui::Separator();
+    ImGui::Checkbox("Color Grading", &settings->colorGradingEnabled);
+    if (settings->colorGradingEnabled) {
+        ImGui::Indent();
+        ImGui::SliderFloat("LUT Strength", &settings->lutStrength, 0.0f, 1.0f);
+        ImGui::SliderFloat("Vignette", &settings->vignetteIntensity, 0.0f, 1.0f);
+        ImGui::SliderFloat("Vignette Radius", &settings->vignetteRadius, 0.1f, 1.0f);
+        ImGui::SliderFloat("Film Grain", &settings->grainStrength, 0.0f, 0.2f);
+        ImGui::SliderFloat("Chromatic Aberration", &settings->chromaticAberration, 0.0f, 5.0f);
+        ImGui::Unindent();
+    }
+
+    ImGui::End();
+}
+
+void DebugUI::DrawToneMappingPanel(PostProcessSettings* settings) {
+    if (!settings) return;
+
+    ImGui::Begin("Tone Mapping");
+
+    const char* curves[] = { "ACES Filmic", "AgX" };
+    int curveIdx = static_cast<int>(settings->toneCurve);
+    if (ImGui::Combo("Curve", &curveIdx, curves, 2))
+        settings->toneCurve = static_cast<PostProcessSettings::ToneCurve>(curveIdx);
+
+    ImGui::Separator();
+    ImGui::SliderFloat("Exposure Bias (EV)", &settings->exposureBias, -5.0f, 5.0f);
+
+    ImGui::Separator();
+    if (settings->toneCurve == PostProcessSettings::ToneCurve::ACES) {
+        ImGui::Text("ACES Parameters");
+        ImGui::SliderFloat("Shoulder Strength", &settings->acesShoulderStrength, 0.0f, 10.0f);
+        ImGui::SliderFloat("Linear Strength", &settings->acesLinearStrength, 0.0f, 1.0f);
+        ImGui::SliderFloat("Linear Angle", &settings->acesLinearAngle, 0.0f, 5.0f);
+        ImGui::SliderFloat("Toe Strength", &settings->acesToeStrength, 0.0f, 2.0f);
+        ImGui::SliderFloat("White Point", &settings->acesWhitePoint, 1.0f, 30.0f);
+    } else {
+        ImGui::Text("AgX Parameters");
+        ImGui::SliderFloat("Saturation", &settings->agxSaturation, 0.0f, 3.0f);
+        ImGui::SliderFloat("Punch", &settings->agxPunch, 0.0f, 1.0f);
+    }
+
+    if (ImGui::Button("Reset ACES Defaults")) {
+        settings->acesShoulderStrength = 2.51f;
+        settings->acesLinearStrength   = 0.03f;
+        settings->acesLinearAngle      = 2.43f;
+        settings->acesToeStrength      = 0.59f;
+        settings->acesWhitePoint       = 11.2f;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reset AgX Defaults")) {
+        settings->agxSaturation = 1.0f;
+        settings->agxPunch      = 0.0f;
     }
 
     ImGui::End();

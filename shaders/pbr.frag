@@ -186,11 +186,8 @@ void main() {
     // ---- Emissive ----
     vec3 emissive = texture(textures[nonuniformEXT(mat.emissiveTexIdx)], fragTexCoord).rgb;
 
-    // ---- Final ----
+    // ---- Final (HDR output, tone mapping handled in post-processing) ----
     vec3 color = ambient + Lo + emissive;
-
-    // Reinhard tonemapping (sRGB swapchain handles gamma)
-    color = color / (color + vec3(1.0));
 
     outColor = vec4(color, baseColor.a);
 }

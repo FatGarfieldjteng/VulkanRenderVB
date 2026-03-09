@@ -173,7 +173,5 @@ void main() {
 
     vec3 color = ambient + Lo + emissive;
 
-    color = color / (color + vec3(1.0));
-
     outColor = vec4(color, baseColor.a);
 }

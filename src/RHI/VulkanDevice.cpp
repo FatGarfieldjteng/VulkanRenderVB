@@ -115,10 +115,13 @@ void VulkanDevice::CreateLogicalDevice() {
     features11.sType                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
     features11.pNext                = &features12;
     features11.shaderDrawParameters = VK_TRUE;
-    features12.descriptorIndexing                          = VK_TRUE;
-    features12.descriptorBindingPartiallyBound             = VK_TRUE;
-    features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
-    features12.runtimeDescriptorArray                      = VK_TRUE;
+    features12.descriptorIndexing                            = VK_TRUE;
+    features12.descriptorBindingPartiallyBound               = VK_TRUE;
+    features12.descriptorBindingSampledImageUpdateAfterBind   = VK_TRUE;
+    features12.descriptorBindingStorageBufferUpdateAfterBind  = VK_TRUE;
+    features12.descriptorBindingStorageImageUpdateAfterBind   = VK_TRUE;
+    features12.descriptorBindingUniformBufferUpdateAfterBind  = VK_TRUE;
+    features12.runtimeDescriptorArray                        = VK_TRUE;
     features12.shaderSampledImageArrayNonUniformIndexing   = VK_TRUE;
     features12.descriptorBindingVariableDescriptorCount    = VK_TRUE;
     features12.drawIndirectCount                           = VK_TRUE;
@@ -131,6 +134,7 @@ void VulkanDevice::CreateLogicalDevice() {
     features2.features.fillModeNonSolid       = VK_TRUE;
     features2.features.pipelineStatisticsQuery = VK_TRUE;
     features2.features.wideLines              = VK_TRUE;
+    features2.features.sampleRateShading      = VK_TRUE;
 
     VkDeviceCreateInfo createInfo{};
     createInfo.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;

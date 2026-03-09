@@ -17,13 +17,22 @@ public:
     struct Desc {
         ResourceHandle          csmResource;
         ResourceHandle          depthResource;
-        ResourceHandle          swapchainResource;
+        ResourceHandle          colorResource;
         PassHandle              shadowPassHandle;
         VkExtent2D              extent;
-        VkImageView             swapchainView;
+        VkImageView             colorView;
         VkImageView             depthView;
         VkPipeline              pipeline;
         VkPipelineLayout        pipelineLayout;
+
+        VkSampleCountFlagBits   msaaSamples          = VK_SAMPLE_COUNT_1_BIT;
+        VkImage                 msaaColorImage       = VK_NULL_HANDLE;
+        VkImageView             msaaColorView        = VK_NULL_HANDLE;
+        VkImage                 msaaDepthImage       = VK_NULL_HANDLE;
+        VkImageView             msaaDepthView        = VK_NULL_HANDLE;
+        VkImageView             resolveColorView     = VK_NULL_HANDLE;
+        VkImage                 resolveDepthImage    = VK_NULL_HANDLE;
+        VkImageView             resolveDepthView     = VK_NULL_HANDLE;
         VkDescriptorSet         bindlessSet;
         VkDescriptorSet         frameDescSet;
         const Registry*         registry;

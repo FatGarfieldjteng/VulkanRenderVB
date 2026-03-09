@@ -9,6 +9,7 @@ class GPUProfiler;
 class PipelineStatistics;
 class Registry;
 struct GPUMaterialData;
+struct PostProcessSettings;
 
 struct DebugUIState {
     bool gpuDriven        = true;
@@ -24,6 +25,9 @@ struct DebugUIState {
 
     bool showDemoWindow    = false;
     bool pipelineStatsEnabled = false;
+
+    int  msaaIndex = 0;
+    bool msaaChanged = false;
 };
 
 class DebugUI {
@@ -36,7 +40,9 @@ public:
 
     void BeginFrame();
     void BuildUI(float deltaTime, const GPUProfiler* profiler, const PipelineStatistics* pipeStats,
-                 Registry* registry = nullptr, std::vector<GPUMaterialData>* materials = nullptr);
+                 Registry* registry = nullptr, std::vector<GPUMaterialData>* materials = nullptr,
+                 PostProcessSettings* ppSettings = nullptr,
+                 const std::vector<VkSampleCountFlagBits>* supportedMSAA = nullptr);
     void EndFrame();
 
     void Render(VkCommandBuffer cmd, VkImageView colorView, VkExtent2D extent);
@@ -49,11 +55,13 @@ public:
 
 private:
     void DrawMainMenuBar();
-    void DrawRenderSettingsPanel(float deltaTime);
+    void DrawRenderSettingsPanel(float deltaTime, const std::vector<VkSampleCountFlagBits>* supportedMSAA);
     void DrawProfilerPanel(const GPUProfiler* profiler);
     void DrawPipelineStatsPanel(const PipelineStatistics* pipeStats);
     void DrawSceneHierarchyPanel(Registry* registry);
     void DrawMaterialEditorPanel(std::vector<GPUMaterialData>* materials);
+    void DrawPostProcessPanel(PostProcessSettings* settings);
+    void DrawToneMappingPanel(PostProcessSettings* settings);
 
     VkDescriptorPool mDescriptorPool = VK_NULL_HANDLE;
     DebugUIState     mState;

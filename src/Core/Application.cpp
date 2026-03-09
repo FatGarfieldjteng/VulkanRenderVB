@@ -8,6 +8,7 @@
 #include "RenderGraph/Passes/OccluderDepthPass.h"
 #include "RenderGraph/Passes/HiZBuildPass.h"
 #include "RenderGraph/Passes/OcclusionTestPass.h"
+#include "RenderGraph/Passes/PostProcessPass.h"
 #include "GPU/MeshPool.h"
 #include "GPU/IndirectRenderer.h"
 #include "GPU/HiZBuffer.h"
@@ -139,6 +140,18 @@ void Application::InitVulkan() {
                                mSwapchain.GetImageCount());
     mImageFences.resize(mSwapchain.GetImageCount(), VK_NULL_HANDLE);
 
+    {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(mDevice.GetPhysicalDevice(), &props);
+        VkSampleCountFlags counts = props.limits.framebufferColorSampleCounts
+                                  & props.limits.framebufferDepthSampleCounts;
+        mSupportedMSAA.push_back(VK_SAMPLE_COUNT_1_BIT);
+        if (counts & VK_SAMPLE_COUNT_2_BIT) mSupportedMSAA.push_back(VK_SAMPLE_COUNT_2_BIT);
+        if (counts & VK_SAMPLE_COUNT_4_BIT) mSupportedMSAA.push_back(VK_SAMPLE_COUNT_4_BIT);
+        if (counts & VK_SAMPLE_COUNT_8_BIT) mSupportedMSAA.push_back(VK_SAMPLE_COUNT_8_BIT);
+        LOG_INFO("Supported MSAA up to: {}x", static_cast<int>(mSupportedMSAA.back()));
+    }
+
     mTransfer.Initialize(mDevice.GetHandle(), mDevice.GetQueueFamilyIndices().graphicsFamily,
                          mDevice.GetGraphicsQueue());
     mDescriptors.Initialize(mDevice.GetHandle());
@@ -161,6 +174,13 @@ void Application::InitVulkan() {
     CreatePipelines();
 
     InitGPUDriven();
+
+    {
+        auto extent = mSwapchain.GetExtent();
+        mPostProcess.Initialize(mDevice.GetHandle(), mMemory.GetAllocator(), mShaders,
+                                mSwapchain.GetImageFormat(), extent.width, extent.height);
+    }
+
     InitDebugUI();
 
     mModelData = ModelData{};
@@ -616,11 +636,11 @@ void Application::CreatePipelines() {
         layoutCI.pPushConstantRanges    = &pushRange;
         VK_CHECK(vkCreatePipelineLayout(device, &layoutCI, nullptr, &mPBRPipelineLayout));
 
-        VkFormat colorFormat = mSwapchain.GetImageFormat();
+        VkFormat hdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
         VkPipelineRenderingCreateInfo renderInfo{};
         renderInfo.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
         renderInfo.colorAttachmentCount    = 1;
-        renderInfo.pColorAttachmentFormats = &colorFormat;
+        renderInfo.pColorAttachmentFormats = &hdrFormat;
         renderInfo.depthAttachmentFormat   = VK_FORMAT_D32_SFLOAT;
 
         VkGraphicsPipelineCreateInfo ci{};
@@ -746,11 +766,11 @@ void Application::CreatePipelines() {
         layoutCII.pSetLayouts    = setLayoutsI;
         VK_CHECK(vkCreatePipelineLayout(device, &layoutCII, nullptr, &mPBRIndirectPipelineLayout));
 
-        VkFormat colorFormatI = mSwapchain.GetImageFormat();
+        VkFormat hdrFormatI = VK_FORMAT_R16G16B16A16_SFLOAT;
         VkPipelineRenderingCreateInfo renderInfoI{};
         renderInfoI.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
         renderInfoI.colorAttachmentCount    = 1;
-        renderInfoI.pColorAttachmentFormats = &colorFormatI;
+        renderInfoI.pColorAttachmentFormats = &hdrFormatI;
         renderInfoI.depthAttachmentFormat   = VK_FORMAT_D32_SFLOAT;
 
         VkGraphicsPipelineCreateInfo ciI{};
@@ -940,7 +960,8 @@ void Application::MainLoop() {
 
         if (mShowUI) {
             mDebugUI.BeginFrame();
-            mDebugUI.BuildUI(dt, &mGPUProfiler, &mPipelineStats, &mRegistry, &mGPUMaterials);
+            mDebugUI.BuildUI(dt, &mGPUProfiler, &mPipelineStats, &mRegistry, &mGPUMaterials,
+                           &mPostProcess.GetSettings(), &mSupportedMSAA);
             mDebugUI.EndFrame();
         }
 
@@ -1153,13 +1174,17 @@ void Application::BuildAndExecuteRenderGraph(VkCommandBuffer cmd, uint32_t image
     }
     auto shadowPassH = mRenderGraph.AddPass(std::make_unique<ShadowPass>(shadowDesc));
 
+    auto hdrRes = mRenderGraph.AddImage("HDRColor",
+        mPostProcess.GetHDRImage(), mPostProcess.GetHDRView(),
+        VK_IMAGE_LAYOUT_UNDEFINED);
+
     ForwardPass::Desc fwdDesc{};
     fwdDesc.csmResource        = csmRes;
     fwdDesc.depthResource      = depthRes;
-    fwdDesc.swapchainResource  = swapRes;
+    fwdDesc.colorResource      = hdrRes;
     fwdDesc.shadowPassHandle   = shadowPassH;
     fwdDesc.extent             = extent;
-    fwdDesc.swapchainView      = mSwapchain.GetImageViews()[imageIndex];
+    fwdDesc.colorView          = mPostProcess.GetHDRView();
     fwdDesc.depthView          = mDepthImage.GetView();
     fwdDesc.pipeline           = mPBRPipeline;
     fwdDesc.pipelineLayout     = mPBRPipelineLayout;
@@ -1168,6 +1193,16 @@ void Application::BuildAndExecuteRenderGraph(VkCommandBuffer cmd, uint32_t image
     fwdDesc.registry           = &mRegistry;
     fwdDesc.meshPool           = &mMeshPool;
     fwdDesc.gpuMaterials       = &mGPUMaterials;
+    if (mCurrentMSAA != VK_SAMPLE_COUNT_1_BIT && mPostProcess.GetMSAAColorView()) {
+        fwdDesc.msaaSamples       = mCurrentMSAA;
+        fwdDesc.msaaColorImage    = mPostProcess.GetMSAAColorImage();
+        fwdDesc.msaaColorView     = mPostProcess.GetMSAAColorView();
+        fwdDesc.msaaDepthImage    = mPostProcess.GetMSAADepthImage();
+        fwdDesc.msaaDepthView     = mPostProcess.GetMSAADepthView();
+        fwdDesc.resolveColorView  = mPostProcess.GetHDRView();
+        fwdDesc.resolveDepthImage = mDepthImage.GetImage();
+        fwdDesc.resolveDepthView  = mDepthImage.GetView();
+    }
     if (useGPU) {
         fwdDesc.gpuDriven                = true;
         fwdDesc.occlusionEnabled         = useOcclusion;
@@ -1184,12 +1219,38 @@ void Application::BuildAndExecuteRenderGraph(VkCommandBuffer cmd, uint32_t image
     }
     auto forwardPassH = mRenderGraph.AddPass(std::make_unique<ForwardPass>(fwdDesc));
 
-    RenderGraph::PassHandle lastPassBeforePresent = forwardPassH;
+    // Post-processing: HDR → swapchain
+    float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+    glm::mat4 invProj = glm::inverse(mCamera.GetProjectionMatrix(aspect));
+    glm::mat4 proj    = mCamera.GetProjectionMatrix(aspect);
+    float projInfoData[4] = {
+        2.0f / (extent.width * proj[0][0]),
+        2.0f / (extent.height * proj[1][1]),
+        -(1.0f - proj[2][0]) / proj[0][0],
+        -(1.0f + proj[2][1]) / proj[1][1]
+    };
+
+    PostProcessPass::Desc ppDesc{};
+    ppDesc.hdrResource        = hdrRes;
+    ppDesc.depthResource      = depthRes;
+    ppDesc.swapchainResource  = swapRes;
+    ppDesc.forwardPassHandle  = forwardPassH;
+    ppDesc.stack              = &mPostProcess;
+    ppDesc.swapchainView      = mSwapchain.GetImageViews()[imageIndex];
+    ppDesc.depthView          = mDepthImage.GetView();
+    ppDesc.extent             = extent;
+    ppDesc.deltaTime          = mDeltaTime;
+    ppDesc.invProjection      = &invProj[0][0];
+    ppDesc.projInfo           = projInfoData;
+    ppDesc.farPlane           = mCamera.GetFar();
+    auto postProcessPassH = mRenderGraph.AddPass(std::make_unique<PostProcessPass>(ppDesc));
+
+    RenderGraph::PassHandle lastPassBeforePresent = postProcessPassH;
 
     if (mShowUI) {
         ImGuiPass::Desc imguiDesc{};
         imguiDesc.swapchainResource  = swapRes;
-        imguiDesc.previousPassHandle = forwardPassH;
+        imguiDesc.previousPassHandle = postProcessPassH;
         imguiDesc.swapchainView      = mSwapchain.GetImageViews()[imageIndex];
         imguiDesc.extent             = extent;
         imguiDesc.debugUI            = &mDebugUI;
@@ -1318,7 +1379,7 @@ void Application::ShutdownDebugUI() {
 }
 
 void Application::SyncUIState() {
-    const auto& uiState = mDebugUI.GetState();
+    auto& uiState = mDebugUI.GetState();
 
     bool gpuChanged = (mGPUDriven != uiState.gpuDriven) ||
                       (mOcclusionCulling != uiState.occlusionCulling);
@@ -1332,6 +1393,17 @@ void Application::SyncUIState() {
     if (gpuChanged) {
         LOG_INFO("Render mode changed: GPU-driven={}, occlusion={}",
                  mGPUDriven, mOcclusionCulling);
+    }
+
+    if (uiState.msaaChanged) {
+        uiState.msaaChanged = false;
+        int idx = std::clamp(uiState.msaaIndex, 0, static_cast<int>(mSupportedMSAA.size()) - 1);
+        VkSampleCountFlagBits newSamples = mSupportedMSAA[idx];
+        if (newSamples != mCurrentMSAA) {
+            mDevice.WaitIdle();
+            mPostProcess.SetMSAASampleCount(mDevice.GetHandle(), mMemory.GetAllocator(), newSamples);
+            RecreatePBRPipelines(newSamples);
+        }
     }
 }
 
@@ -1412,9 +1484,21 @@ void Application::RecreateSwapchain() {
         auto extent = mSwapchain.GetExtent();
         mHiZBuffer.Resize(mDevice.GetHandle(), mMemory.GetAllocator(), extent.width, extent.height);
         mHiZBuffer.SetSourceDepth(mDepthImage.GetView());
+
+        mComputeCulling.UpdateBuffers(mMemory.GetAllocator(),
+            mIndirectRenderer.GetIndirectBuffer(),
+            mIndirectRenderer.GetDrawCount(),
+            mIndirectRenderer.GetObjectBuffer(),
+            mHiZBuffer.GetView(),
+            mHiZBuffer.GetSampler());
     }
 
-    LOG_INFO("Swapchain recreated");
+    {
+        auto extent = mSwapchain.GetExtent();
+        mPostProcess.Resize(mDevice.GetHandle(), mMemory.GetAllocator(), extent.width, extent.height);
+    }
+
+    LOG_INFO("Swapchain recreated (MSAA: {}x)", static_cast<int>(mCurrentMSAA));
 }
 
 // =======================================================================
@@ -1438,6 +1522,8 @@ void Application::CleanupVulkan() {
         mSecondaryCommandBuffers.clear();
         mThreadPool.Shutdown();
     }
+
+    mPostProcess.Shutdown(device, allocator);
 
     ShutdownGPUDriven();
 
@@ -1507,4 +1593,153 @@ void Application::CleanupVulkan() {
     mWindow.Shutdown();
 
     LOG_INFO("Cleanup complete");
+}
+
+void Application::RecreatePBRPipelines(VkSampleCountFlagBits samples) {
+    auto device = mDevice.GetHandle();
+
+    if (mPBRPipeline)         { vkDestroyPipeline(device, mPBRPipeline, nullptr);         mPBRPipeline = VK_NULL_HANDLE; }
+    if (mPBRIndirectPipeline) { vkDestroyPipeline(device, mPBRIndirectPipeline, nullptr); mPBRIndirectPipeline = VK_NULL_HANDLE; }
+
+    VkVertexInputBindingDescription bindingDesc{};
+    bindingDesc.binding   = 0;
+    bindingDesc.stride    = sizeof(MeshVertex);
+    bindingDesc.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    VkVertexInputAttributeDescription attrDescs[4]{};
+    attrDescs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT,    offsetof(MeshVertex, position)};
+    attrDescs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT,    offsetof(MeshVertex, normal)};
+    attrDescs[2] = {2, 0, VK_FORMAT_R32G32_SFLOAT,       offsetof(MeshVertex, texCoord)};
+    attrDescs[3] = {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshVertex, tangent)};
+
+    VkPipelineVertexInputStateCreateInfo vertexInput{};
+    vertexInput.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertexInput.vertexBindingDescriptionCount   = 1;
+    vertexInput.pVertexBindingDescriptions      = &bindingDesc;
+    vertexInput.vertexAttributeDescriptionCount = 4;
+    vertexInput.pVertexAttributeDescriptions    = attrDescs;
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+    inputAssembly.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount  = 1;
+
+    VkDynamicState dynStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = 2;
+    dynamicState.pDynamicStates    = dynStates;
+
+    VkPipelineMultisampleStateCreateInfo multisampling{};
+    multisampling.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling.rasterizationSamples = samples;
+    if (samples != VK_SAMPLE_COUNT_1_BIT) {
+        multisampling.sampleShadingEnable  = VK_TRUE;
+        multisampling.minSampleShading     = 0.25f;
+    }
+
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable  = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_TRUE;
+    depthStencil.depthCompareOp   = VK_COMPARE_OP_LESS;
+
+    VkPipelineColorBlendAttachmentState blendAtt{};
+    blendAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo colorBlend{};
+    colorBlend.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlend.attachmentCount = 1;
+    colorBlend.pAttachments    = &blendAtt;
+
+    VkFormat hdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkPipelineRenderingCreateInfo renderInfo{};
+    renderInfo.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    renderInfo.colorAttachmentCount    = 1;
+    renderInfo.pColorAttachmentFormats = &hdrFormat;
+    renderInfo.depthAttachmentFormat   = VK_FORMAT_D32_SFLOAT;
+
+    {
+        VkShaderModule vert = mShaders.GetOrLoad("shaders/pbr.vert.spv");
+        VkShaderModule frag = mShaders.GetOrLoad("shaders/pbr.frag.spv");
+
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                     VK_SHADER_STAGE_VERTEX_BIT, vert, "main", nullptr};
+        stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                     VK_SHADER_STAGE_FRAGMENT_BIT, frag, "main", nullptr};
+
+        VkPipelineRasterizationStateCreateInfo rasterizer{};
+        rasterizer.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizer.cullMode    = VK_CULL_MODE_BACK_BIT;
+        rasterizer.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterizer.lineWidth   = 1.0f;
+
+        VkGraphicsPipelineCreateInfo ci{};
+        ci.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        ci.pNext               = &renderInfo;
+        ci.stageCount          = 2;
+        ci.pStages             = stages;
+        ci.pVertexInputState   = &vertexInput;
+        ci.pInputAssemblyState = &inputAssembly;
+        ci.pViewportState      = &viewportState;
+        ci.pRasterizationState = &rasterizer;
+        ci.pMultisampleState   = &multisampling;
+        ci.pDepthStencilState  = &depthStencil;
+        ci.pColorBlendState    = &colorBlend;
+        ci.pDynamicState       = &dynamicState;
+        ci.layout              = mPBRPipelineLayout;
+
+        VK_CHECK(vkCreateGraphicsPipelines(device, mPipelines.GetCache(), 1, &ci, nullptr, &mPBRPipeline));
+    }
+
+    {
+        VkShaderModule vert = mShaders.GetOrLoad("shaders/pbr_indirect.vert.spv");
+        VkShaderModule frag = mShaders.GetOrLoad("shaders/pbr_indirect.frag.spv");
+
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                     VK_SHADER_STAGE_VERTEX_BIT, vert, "main", nullptr};
+        stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                     VK_SHADER_STAGE_FRAGMENT_BIT, frag, "main", nullptr};
+
+        VkPipelineRasterizationStateCreateInfo rasterizer{};
+        rasterizer.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizer.cullMode    = VK_CULL_MODE_BACK_BIT;
+        rasterizer.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterizer.lineWidth   = 1.0f;
+
+        VkPipelineDepthStencilStateCreateInfo depthStencilI{};
+        depthStencilI.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depthStencilI.depthTestEnable  = VK_TRUE;
+        depthStencilI.depthWriteEnable = VK_TRUE;
+        depthStencilI.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+        VkGraphicsPipelineCreateInfo ci{};
+        ci.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        ci.pNext               = &renderInfo;
+        ci.stageCount          = 2;
+        ci.pStages             = stages;
+        ci.pVertexInputState   = &vertexInput;
+        ci.pInputAssemblyState = &inputAssembly;
+        ci.pViewportState      = &viewportState;
+        ci.pRasterizationState = &rasterizer;
+        ci.pMultisampleState   = &multisampling;
+        ci.pDepthStencilState  = &depthStencilI;
+        ci.pColorBlendState    = &colorBlend;
+        ci.pDynamicState       = &dynamicState;
+        ci.layout              = mPBRIndirectPipelineLayout;
+
+        VK_CHECK(vkCreateGraphicsPipelines(device, mPipelines.GetCache(), 1, &ci, nullptr, &mPBRIndirectPipeline));
+    }
+
+    mCurrentMSAA = samples;
+    LOG_INFO("PBR pipelines recreated with {}x MSAA", static_cast<int>(samples));
 }

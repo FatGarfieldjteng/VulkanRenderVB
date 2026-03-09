@@ -1,0 +1,65 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D srcTexture;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D dstTexture;
+
+layout(push_constant) uniform Params {
+    vec2  srcTexelSize;
+    uvec2 dstSize;
+    uint  mipLevel;
+};
+
+float KarisAverage(vec3 c) {
+    float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    return 1.0 / (1.0 + lum);
+}
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (coord.x >= int(dstSize.x) || coord.y >= int(dstSize.y))
+        return;
+
+    vec2 uv = (vec2(coord) + 0.5) / vec2(dstSize);
+
+    // 13-tap downsample filter (see Call of Duty: Advanced Warfare presentation)
+    vec3 A = texture(srcTexture, uv + srcTexelSize * vec2(-2, -2)).rgb;
+    vec3 B = texture(srcTexture, uv + srcTexelSize * vec2( 0, -2)).rgb;
+    vec3 C = texture(srcTexture, uv + srcTexelSize * vec2( 2, -2)).rgb;
+    vec3 D = texture(srcTexture, uv + srcTexelSize * vec2(-1, -1)).rgb;
+    vec3 E = texture(srcTexture, uv + srcTexelSize * vec2( 1, -1)).rgb;
+    vec3 F = texture(srcTexture, uv + srcTexelSize * vec2(-2,  0)).rgb;
+    vec3 G = texture(srcTexture, uv                               ).rgb;
+    vec3 H = texture(srcTexture, uv + srcTexelSize * vec2( 2,  0)).rgb;
+    vec3 I = texture(srcTexture, uv + srcTexelSize * vec2(-1,  1)).rgb;
+    vec3 J = texture(srcTexture, uv + srcTexelSize * vec2( 1,  1)).rgb;
+    vec3 K = texture(srcTexture, uv + srcTexelSize * vec2(-2,  2)).rgb;
+    vec3 L = texture(srcTexture, uv + srcTexelSize * vec2( 0,  2)).rgb;
+    vec3 M = texture(srcTexture, uv + srcTexelSize * vec2( 2,  2)).rgb;
+
+    vec3 result;
+    if (mipLevel == 0) {
+        vec3 g0 = (D + E + I + J) * 0.25;
+        vec3 g1 = (A + B + D + G) * 0.25;
+        vec3 g2 = (B + C + E + H) * 0.25;
+        vec3 g3 = (F + G + I + K) * 0.25;
+        vec3 g4 = (G + H + J + M) * 0.25;
+
+        float w0 = KarisAverage(g0);
+        float w1 = KarisAverage(g1);
+        float w2 = KarisAverage(g2);
+        float w3 = KarisAverage(g3);
+        float w4 = KarisAverage(g4);
+
+        result = (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) /
+                 (w0 + w1 + w2 + w3 + w4);
+    } else {
+        result  = G * 0.125;
+        result += (D + E + I + J) * 0.03125 * 4.0;
+        result += (B + F + H + L) * 0.0625;
+        result += (A + C + K + M) * 0.03125;
+    }
+
+    imageStore(dstTexture, coord, vec4(result, 1.0));
+}

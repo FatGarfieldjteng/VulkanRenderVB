@@ -8,6 +8,7 @@
 #include <vector>
 #include <unordered_map>
 #include <functional>
+#include <memory>
 
 struct ImageKey {
     VkFormat             format      = VK_FORMAT_UNDEFINED;

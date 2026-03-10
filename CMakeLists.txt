@@ -19,6 +19,10 @@ set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+if(UNIX AND NOT APPLE)
+    set(GLFW_BUILD_WAYLAND ON CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_X11 ON CACHE BOOL "" FORCE)
+endif()
 FetchContent_Declare(glfw
     GIT_REPOSITORY https://github.com/glfw/glfw.git
     GIT_TAG        3.4
@@ -62,6 +66,7 @@ FetchContent_MakeAvailable(volk glfw spdlog glm VulkanMemoryAllocator tinygltf i
 # --- Shader compilation ---
 find_program(GLSLANG_VALIDATOR glslangValidator
     HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin"
+          "/usr/bin"
 )
 if(NOT GLSLANG_VALIDATOR)
     message(FATAL_ERROR "glslangValidator not found. Install Vulkan SDK and set VULKAN_SDK environment variable.")
@@ -120,17 +125,25 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     spdlog::spdlog
 )
 
+if(UNIX AND NOT APPLE)
+    find_package(Threads REQUIRED)
+    target_link_libraries(${PROJECT_NAME} PRIVATE Threads::Threads dl)
+endif()
+
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     $<$<CONFIG:Debug>:VRB_DEBUG>
     VMA_STATIC_VULKAN_FUNCTIONS=0
     VMA_DYNAMIC_VULKAN_FUNCTIONS=1
     GLM_FORCE_DEPTH_ZERO_TO_ONE
-    NOMINMAX
+    $<$<PLATFORM_ID:Windows>:NOMINMAX>
+    GLFW_INCLUDE_NONE
     IMGUI_IMPL_VULKAN_NO_PROTOTYPES
 )
 
-# VS debugger working directory = build dir (so it finds shaders/)
-set_property(TARGET ${PROJECT_NAME} PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+if(WIN32)
+    # VS debugger working directory = build dir (so it finds shaders/)
+    set_property(TARGET ${PROJECT_NAME} PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 
-# Organize source files in VS solution filters mirroring the directory tree
-source_group(TREE "${CMAKE_SOURCE_DIR}/src" PREFIX "Source" FILES ${SOURCES})
+    # Organize source files in VS solution filters mirroring the directory tree
+    source_group(TREE "${CMAKE_SOURCE_DIR}/src" PREFIX "Source" FILES ${SOURCES})
+endif()

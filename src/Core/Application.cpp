@@ -20,7 +20,6 @@
 #include "VisualUI/DebugVisualization.h"
 #include "VisualUI/PipelineStatistics.h"
 
-#define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>

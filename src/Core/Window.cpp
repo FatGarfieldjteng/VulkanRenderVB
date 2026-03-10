@@ -1,7 +1,6 @@
 #include "Core/Window.h"
 #include "Core/Logger.h"
 
-#define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
 void Window::Initialize(uint32_t width, uint32_t height, const std::string& title) {

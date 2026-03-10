@@ -1,8 +1,12 @@
 # Build
 build/
+build-wsl/
 out/
 cmake-build-*/
 *.spv
+
+# Assets
+assets/
 
 # IDE
 .vs/

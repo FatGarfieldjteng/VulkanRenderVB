@@ -11,10 +11,20 @@ class Registry;
 struct GPUMaterialData;
 struct PostProcessSettings;
 
+enum class SceneType : int { Sponza = 0, TestScene = 1 };
+
 struct DebugUIState {
     bool gpuDriven        = true;
     bool occlusionCulling = true;
     float occluderRatio   = 0.2f;
+
+    SceneType sceneType    = SceneType::TestScene;
+    bool      sceneChanged = false;
+
+    // Lighting
+    float lightAzimuth   = 53.0f;   // horizontal angle in degrees
+    float lightElevation = 58.0f;   // angle above horizon in degrees
+    bool  csmEnabled     = true;
 
     enum class VisMode : int {
         None = 0, Wireframe, WorldNormals, TangentNormals,
@@ -28,6 +38,16 @@ struct DebugUIState {
 
     int  msaaIndex = 0;
     bool msaaChanged = false;
+
+    // Ray Tracing (Phase 9)
+    bool  rtShadowsEnabled  = true;
+    bool  rtReflEnabled      = true;
+    float rtShadowStrength   = 1.0f;
+    float rtReflStrength     = 0.5f;
+    float rtReflRoughness    = 0.15f;
+    float rtLightRadius      = 0.02f;
+    bool  rtAvailable        = false;
+    bool  rtDebugShadowVis   = false;
 };
 
 class DebugUI {

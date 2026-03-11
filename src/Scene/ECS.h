@@ -31,6 +31,11 @@ public:
     T*       Get(Entity e)       { return (e < mValid.size() && mValid[e]) ? &mData[e] : nullptr; }
     const T* Get(Entity e) const { return (e < mValid.size() && mValid[e]) ? &mData[e] : nullptr; }
 
+    void Clear() {
+        mData.clear();
+        mValid.clear();
+    }
+
     template<typename Fn> void ForEach(Fn&& fn) {
         for (uint32_t i = 0; i < static_cast<uint32_t>(mData.size()); i++)
             if (mValid[i]) fn(static_cast<Entity>(i), mData[i]);
@@ -182,6 +187,17 @@ public:
     }
 
     uint32_t EntityCount() const { return static_cast<uint32_t>(mAlive.size()); }
+
+    void Clear() {
+        mTransforms.Clear();
+        mMeshes.Clear();
+        mMaterials.Clear();
+        mLights.Clear();
+        mAlive.clear();
+        mFreeList.clear();
+        mChildren.clear();
+        mNextId = 0;
+    }
 
 private:
     void PropagateChildren(Entity parent, const glm::mat4& parentWorld) {

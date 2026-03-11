@@ -3,7 +3,9 @@
 #include "Core/Logger.h"
 
 void MeshPool::Upload(VmaAllocator allocator, const TransferManager& transfer,
-                      const std::vector<MeshData>& meshes)
+                      const std::vector<MeshData>& meshes,
+                      VkBufferUsageFlags extraVertexFlags,
+                      VkBufferUsageFlags extraIndexFlags)
 {
     if (meshes.empty()) return;
 
@@ -37,6 +39,7 @@ void MeshPool::Upload(VmaAllocator allocator, const TransferManager& transfer,
         cmd.firstIndex    = firstIndex;
         cmd.vertexOffset  = static_cast<int32_t>(vertexOffset);
         cmd.firstInstance = 0;
+        cmd.vertexCount   = static_cast<uint32_t>(m.vertices.size());
         cmd.materialIndex = (m.materialIndex >= 0) ? static_cast<uint32_t>(m.materialIndex) : 0;
         cmd.bounds        = bounds;
         mDrawCommands.push_back(cmd);
@@ -49,11 +52,11 @@ void MeshPool::Upload(VmaAllocator allocator, const TransferManager& transfer,
     }
 
     mVertexBuffer.CreateDeviceLocal(allocator, transfer,
-        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | extraVertexFlags,
         allVertices.data(), allVertices.size() * sizeof(MeshVertex));
 
     mIndexBuffer.CreateDeviceLocal(allocator, transfer,
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | extraIndexFlags,
         allIndices.data(), allIndices.size() * sizeof(uint32_t));
 
     LOG_INFO("MeshPool uploaded: {} meshes, {} vertices ({} KB), {} indices ({} KB)",

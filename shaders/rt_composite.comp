@@ -1,0 +1,55 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D hdrImage;
+layout(set = 0, binding = 1) uniform sampler2D rtShadowTex;
+layout(set = 0, binding = 2) uniform sampler2D rtReflectionTex;
+
+layout(push_constant) uniform PushConstants {
+    uvec2 resolution;
+    float shadowStrength;      // how much RT shadows darken (0 = no effect, 1 = full)
+    float reflectionStrength;  // how much RT reflections contribute
+    uint  enableShadows;
+    uint  enableReflections;
+    uint  debugShadowVis;      // 1 = show raw shadow map as grayscale
+};
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(resolution)))) return;
+
+    vec4 hdr = imageLoad(hdrImage, pixel);
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(resolution);
+
+    if (debugShadowVis != 0) {
+        if (enableShadows != 0) {
+            float s = clamp(texture(rtShadowTex, uv).r, 0.0, 1.0);
+            if (isnan(s)) s = 0.5;
+            hdr = vec4(s, s, s, 1.0);
+        } else {
+            hdr = vec4(0.0, 0.0, 1.0, 1.0);
+        }
+        imageStore(hdrImage, pixel, hdr);
+        return;
+    }
+
+    if (enableShadows != 0) {
+        float rtShadow = clamp(texture(rtShadowTex, uv).r, 0.0, 1.0);
+        if (isnan(rtShadow)) rtShadow = 1.0;
+        float shadowMul = 0.3 + 0.7 * rtShadow;
+        hdr.rgb *= mix(1.0, shadowMul, shadowStrength);
+    }
+
+    if (enableReflections != 0) {
+        vec4 rtRefl = texture(rtReflectionTex, uv);
+        rtRefl = clamp(rtRefl, vec4(0.0), vec4(10.0));
+        if (any(isnan(rtRefl))) rtRefl = vec4(0.0);
+        float blendFactor = rtRefl.a * reflectionStrength;
+        float lum = dot(hdr.rgb, vec3(0.2126, 0.7152, 0.0722));
+        vec3 modRefl = rtRefl.rgb * max(lum, 0.05);
+        hdr.rgb = mix(hdr.rgb, modRefl, blendFactor);
+    }
+
+    imageStore(hdrImage, pixel, hdr);
+}

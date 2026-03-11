@@ -57,6 +57,8 @@ public:
     static bool LoadGLTF(const std::string& path, ModelData& outModel);
     static void GenerateProceduralCube(ModelData& outModel);
     static void GenerateGroundPlane(MeshData& outMesh, float halfSize = 20.0f);
+    static void GenerateUVSphere(MeshData& outMesh, float radius = 0.5f,
+                                 uint32_t sectors = 64, uint32_t stacks = 32);
     static void ComputeTangents(MeshData& mesh);
 
     static void SortMeshesByVolume(std::vector<MeshData>& meshes);

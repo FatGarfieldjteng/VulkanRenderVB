@@ -1,0 +1,95 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D reflInput;
+layout(set = 0, binding = 1, rgba16f) uniform image2D reflOutput;
+layout(set = 0, binding = 2) uniform sampler2D depthTex;
+
+layout(push_constant) uniform PushConstants {
+    mat4  invViewProj;
+    uvec2 resolution;
+    int   stepSize;
+    float depthSigma;
+    float normalSigma;
+    float colorSigma;
+};
+
+const float kernel[3] = float[](1.0, 2.0/3.0, 1.0/6.0);
+
+vec3 ReconstructWorldPos(ivec2 coord) {
+    float d = texelFetch(depthTex, coord, 0).r;
+    vec2 uv = (vec2(coord) + 0.5) / vec2(resolution);
+    vec4 clip = vec4(uv * 2.0 - 1.0, d, 1.0);
+    vec4 world = invViewProj * clip;
+    return world.xyz / world.w;
+}
+
+vec3 ReconstructNormal(ivec2 coord) {
+    vec3 P = ReconstructWorldPos(coord);
+
+    ivec2 cL = max(coord - ivec2(1, 0), ivec2(0));
+    ivec2 cR = min(coord + ivec2(1, 0), ivec2(resolution) - 1);
+    ivec2 cU = max(coord - ivec2(0, 1), ivec2(0));
+    ivec2 cD = min(coord + ivec2(0, 1), ivec2(resolution) - 1);
+
+    float d  = texelFetch(depthTex, coord, 0).r;
+    float dL = texelFetch(depthTex, cL, 0).r;
+    float dR = texelFetch(depthTex, cR, 0).r;
+    float dU = texelFetch(depthTex, cU, 0).r;
+    float dD = texelFetch(depthTex, cD, 0).r;
+
+    vec3 ddx = (abs(dR - d) < abs(d - dL))
+        ? ReconstructWorldPos(cR) - P
+        : P - ReconstructWorldPos(cL);
+    vec3 ddy = (abs(dD - d) < abs(d - dU))
+        ? ReconstructWorldPos(cD) - P
+        : P - ReconstructWorldPos(cU);
+
+    return normalize(cross(ddy, ddx));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(resolution)))) return;
+
+    vec4  centerColor  = imageLoad(reflInput, pixel);
+    float centerDepth  = texelFetch(depthTex, pixel, 0).r;
+
+    if (centerDepth >= 1.0) {
+        imageStore(reflOutput, pixel, centerColor);
+        return;
+    }
+
+    vec3 centerNormal = ReconstructNormal(pixel);
+
+    float totalWeight = 1.0;
+    vec4  totalColor  = centerColor;
+
+    for (int dy = -2; dy <= 2; dy++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            if (dx == 0 && dy == 0) continue;
+
+            ivec2 sampleCoord = pixel + ivec2(dx, dy) * stepSize;
+            if (any(lessThan(sampleCoord, ivec2(0))) ||
+                any(greaterThanEqual(sampleCoord, ivec2(resolution)))) continue;
+
+            vec4  sampleColor  = imageLoad(reflInput, sampleCoord);
+            float sampleDepth  = texelFetch(depthTex, sampleCoord, 0).r;
+            vec3  sampleNormal = ReconstructNormal(sampleCoord);
+
+            float spatialW = kernel[abs(dx)] * kernel[abs(dy)];
+            float depthW   = exp(-abs(centerDepth - sampleDepth) / depthSigma);
+            float normalW  = pow(max(dot(centerNormal, sampleNormal), 0.0), normalSigma);
+
+            float colorDiff = length(centerColor.rgb - sampleColor.rgb);
+            float colorW    = exp(-colorDiff / colorSigma);
+
+            float w = spatialW * depthW * normalW * colorW;
+            totalColor += sampleColor * w;
+            totalWeight += w;
+        }
+    }
+
+    imageStore(reflOutput, pixel, totalColor / totalWeight);
+}

@@ -85,7 +85,7 @@ foreach(SHADER ${SHADER_SOURCES})
     add_custom_command(
         OUTPUT  ${SHADER_OUTPUT}
         COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUTPUT_DIR}"
-        COMMAND ${GLSLANG_VALIDATOR} -V "${SHADER}" -o "${SHADER_OUTPUT}"
+        COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.2 "${SHADER}" -o "${SHADER_OUTPUT}"
         DEPENDS ${SHADER}
         COMMENT "Compiling shader ${SHADER_NAME}"
     )

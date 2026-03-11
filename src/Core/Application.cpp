@@ -9,6 +9,7 @@
 #include "RenderGraph/Passes/HiZBuildPass.h"
 #include "RenderGraph/Passes/OcclusionTestPass.h"
 #include "RenderGraph/Passes/PostProcessPass.h"
+#include "RenderGraph/Passes/RayTracingPass.h"
 #include "GPU/MeshPool.h"
 #include "GPU/IndirectRenderer.h"
 #include "GPU/HiZBuffer.h"
@@ -27,6 +28,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+
 #include <filesystem>
 #include <array>
 #include <memory>
@@ -167,12 +169,16 @@ void Application::InitVulkan() {
     mRenderGraph.Initialize(mDevice.GetHandle(), &mImageCache);
 
     CreateDefaultTextures();
-    LoadScene();
+    if (mCurrentScene == SceneType::TestScene)
+        LoadTestScene();
+    else
+        LoadScene();
     CreateDepthBuffer();
     CreateFrameDescriptors();
     CreatePipelines();
 
     InitGPUDriven();
+    InitRayTracing();
 
     {
         auto extent = mSwapchain.GetExtent();
@@ -431,11 +437,83 @@ void Application::LoadScene() {
         mGPUMaterials.push_back(def);
     }
 
+    // Demo scene objects for RT (mirror sphere + glossy floor plane)
+    if (mDevice.IsRayTracingSupported()) {
+        uint32_t sphereMeshIdx = static_cast<uint32_t>(mModelData.meshes.size());
+        MeshData sphereMesh;
+        ModelLoader::GenerateUVSphere(sphereMesh, 0.8f, 64, 32);
+        mModelData.meshes.push_back(std::move(sphereMesh));
+
+        uint32_t glossyFloorIdx = static_cast<uint32_t>(mModelData.meshes.size());
+        MeshData floorMesh;
+        ModelLoader::GenerateGroundPlane(floorMesh, 3.0f);
+        mModelData.meshes.push_back(std::move(floorMesh));
+
+        // Mirror material (metallic = 1, roughness ~0)
+        uint32_t mirrorMatIdx = static_cast<uint32_t>(mGPUMaterials.size());
+        {
+            GPUMaterialData m{};
+            m.baseColorFactor         = glm::vec4(0.95f, 0.95f, 0.97f, 1.0f);
+            m.metallicFactor          = 1.0f;
+            m.roughnessFactor         = 0.02f;
+            m.baseColorTexIdx         = mWhiteTexDescIdx;
+            m.normalTexIdx            = mDefaultNormalDescIdx;
+            m.metallicRoughnessTexIdx = mWhiteTexDescIdx;
+            m.aoTexIdx                = mWhiteTexDescIdx;
+            m.emissiveTexIdx          = mBlackTexDescIdx;
+            mGPUMaterials.push_back(m);
+        }
+
+        // Glossy floor material
+        uint32_t glossyMatIdx = static_cast<uint32_t>(mGPUMaterials.size());
+        {
+            GPUMaterialData m{};
+            m.baseColorFactor         = glm::vec4(0.7f, 0.7f, 0.72f, 1.0f);
+            m.metallicFactor          = 0.3f;
+            m.roughnessFactor         = 0.15f;
+            m.baseColorTexIdx         = mWhiteTexDescIdx;
+            m.normalTexIdx            = mDefaultNormalDescIdx;
+            m.metallicRoughnessTexIdx = mWhiteTexDescIdx;
+            m.aoTexIdx                = mWhiteTexDescIdx;
+            m.emissiveTexIdx          = mBlackTexDescIdx;
+            mGPUMaterials.push_back(m);
+        }
+
+        // Place mirror sphere in the Sponza courtyard
+        {
+            Entity e = mRegistry.CreateEntity();
+            auto& tc = mRegistry.AddTransform(e);
+            tc.localPosition = glm::vec3(0.0f, 1.2f, 0.0f);
+            tc.localScale    = glm::vec3(1.0f);
+            mRegistry.AddMesh(e).meshIndex = static_cast<int>(sphereMeshIdx);
+            mRegistry.AddMaterial(e).materialIndex = static_cast<int>(mirrorMatIdx);
+        }
+
+        // Place glossy floor plane
+        {
+            Entity e = mRegistry.CreateEntity();
+            auto& tc = mRegistry.AddTransform(e);
+            tc.localPosition = glm::vec3(0.0f, 0.01f, 0.0f);
+            mRegistry.AddMesh(e).meshIndex = static_cast<int>(glossyFloorIdx);
+            mRegistry.AddMaterial(e).materialIndex = static_cast<int>(glossyMatIdx);
+        }
+
+        LOG_INFO("RT demo objects added: mirror sphere + glossy floor");
+    }
+
     mMaterialSSBO.CreateDeviceLocal(allocator, mTransfer,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         mGPUMaterials.data(), mGPUMaterials.size() * sizeof(GPUMaterialData));
 
-    mMeshPool.Upload(allocator, mTransfer, mModelData.meshes);
+    if (mDevice.IsRayTracingSupported()) {
+        mMeshPool.Upload(allocator, mTransfer, mModelData.meshes,
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    } else {
+        mMeshPool.Upload(allocator, mTransfer, mModelData.meshes);
+    }
 
     LOG_INFO("Scene loaded: {} meshes, {} textures, {} materials, {} entities",
              mMeshPool.GetMeshCount(), mGPUTextures.size(), mGPUMaterials.size(),
@@ -997,18 +1075,23 @@ void Application::DrawFrame() {
     glm::mat4 proj = mCamera.GetProjectionMatrix(aspect);
 
     const auto* sunLight = mRegistry.GetLight(mSunEntity);
-    glm::vec3 sunDir   = sunLight ? sunLight->direction : glm::normalize(glm::vec3(-0.4f, -0.8f, -0.3f));
     glm::vec3 sunColor = sunLight ? sunLight->color     : glm::vec3(1.0f);
     float sunIntensity  = sunLight ? sunLight->intensity : 1.0f;
 
-    mCSM.Update(view, proj, mCamera.GetNear(), mCamera.GetFar(), sunDir);
+    float az = glm::radians(mLightAzimuth);
+    float el = glm::radians(mLightElevation);
+    glm::vec3 sunDir = glm::normalize(glm::vec3(
+        -glm::cos(el) * glm::sin(az), -glm::sin(el), -glm::cos(el) * glm::cos(az)));
+
+    if (mCSMEnabled)
+        mCSM.Update(view, proj, mCamera.GetNear(), mCamera.GetFar(), sunDir);
 
     FrameData fd{};
     fd.view           = view;
     fd.projection     = proj;
     fd.viewProjection = proj * view;
     fd.cameraPos      = glm::vec4(mCamera.GetPosition(), 0.0f);
-    fd.sunDirection   = glm::vec4(sunDir, 0.0f);
+    fd.sunDirection   = glm::vec4(sunDir, mCSMEnabled ? 1.0f : 0.0f);
     fd.sunColor       = glm::vec4(sunColor, sunIntensity);
     for (uint32_t c = 0; c < CascadedShadowMap::CASCADE_COUNT; c++)
         fd.cascadeViewProj[c] = mCSM.GetViewProj(c);
@@ -1158,6 +1241,7 @@ void Application::BuildAndExecuteRenderGraph(VkCommandBuffer cmd, uint32_t image
     ShadowPass::Desc shadowDesc{};
     shadowDesc.csmResource   = csmRes;
     shadowDesc.csm           = &mCSM;
+    shadowDesc.skip          = !mCSMEnabled;
     shadowDesc.pipeline      = mShadowPipeline;
     shadowDesc.pipelineLayout = mShadowPipelineLayout;
     shadowDesc.registry      = &mRegistry;
@@ -1218,6 +1302,66 @@ void Application::BuildAndExecuteRenderGraph(VkCommandBuffer cmd, uint32_t image
     }
     auto forwardPassH = mRenderGraph.AddPass(std::make_unique<ForwardPass>(fwdDesc));
 
+    // --- Ray tracing pass (between forward and post-process) ---
+    RenderGraph::PassHandle rtPassH = RenderGraph::INVALID_PASS;
+    if (mRayTracingEnabled && (mRTShadowsEnabled || mRTReflEnabled)) {
+        float aspect_ = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+        glm::mat4 viewMat_ = mCamera.GetViewMatrix();
+        glm::mat4 projMat_ = mCamera.GetProjectionMatrix(aspect_);
+        glm::mat4 viewProj_ = projMat_ * viewMat_;
+        glm::mat4 invVP_ = glm::inverse(viewProj_);
+
+        const auto* sunLight = mRegistry.GetLight(mSunEntity);
+
+        mRTShadows.SetEnabled(mRTShadowsEnabled);
+        mRTReflections.SetEnabled(mRTReflEnabled);
+
+        // Update composite descriptor set (only when resources change)
+        if (mRTCompositeDescDirty) {
+            VkDescriptorImageInfo hdrInfo{VK_NULL_HANDLE, mPostProcess.GetHDRView(), VK_IMAGE_LAYOUT_GENERAL};
+            VkDescriptorImageInfo shadowInfo{mRTDepthSampler, mRTShadows.GetOutputView(), VK_IMAGE_LAYOUT_GENERAL};
+            VkDescriptorImageInfo reflInfo{mRTDepthSampler, mRTReflections.GetOutputView(), VK_IMAGE_LAYOUT_GENERAL};
+
+            VkWriteDescriptorSet writes[3] = {};
+            writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, mRTCompositeDescSet,
+                          0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hdrInfo};
+            writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, mRTCompositeDescSet,
+                          1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &shadowInfo};
+            writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, mRTCompositeDescSet,
+                          2, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &reflInfo};
+            vkUpdateDescriptorSets(mDevice.GetHandle(), 3, writes, 0, nullptr);
+            mRTCompositeDescDirty = false;
+        }
+
+        RayTracingPass::Desc rtDesc{};
+        rtDesc.depthResource     = depthRes;
+        rtDesc.colorResource     = hdrRes;
+        rtDesc.forwardPassHandle = forwardPassH;
+        rtDesc.shadows           = &mRTShadows;
+        rtDesc.reflections       = &mRTReflections;
+        rtDesc.accel             = &mAccelStructure;
+        rtDesc.depthView         = mDepthImage.GetView();
+        rtDesc.depthSampler      = mRTDepthSampler;
+        rtDesc.extent            = extent;
+        rtDesc.invViewProj       = invVP_;
+        float rtAz = glm::radians(mLightAzimuth);
+        float rtEl = glm::radians(mLightElevation);
+        glm::vec3 rtSunDir = glm::normalize(glm::vec3(
+            -glm::cos(rtEl) * glm::sin(rtAz), -glm::sin(rtEl), -glm::cos(rtEl) * glm::cos(rtAz)));
+        rtDesc.lightDir          = -rtSunDir;
+        rtDesc.lightRadius       = mRTLightRadius;
+        rtDesc.cameraPos         = mCamera.GetPosition();
+        rtDesc.roughness         = mRTReflRoughness;
+        rtDesc.compositePipeline   = mRTCompositePipeline;
+        rtDesc.compositePipeLayout = mRTCompositePipeLayout;
+        rtDesc.compositeDescSet    = mRTCompositeDescSet;
+        rtDesc.shadowStrength      = mRTShadowStrength;
+        rtDesc.reflectionStrength  = mRTReflStrength;
+        rtDesc.debugShadowVis      = mRTDebugShadowVis;
+
+        rtPassH = mRenderGraph.AddPass(std::make_unique<RayTracingPass>(rtDesc));
+    }
+
     // Post-processing: HDR → swapchain
     float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
     glm::mat4 invProj = glm::inverse(mCamera.GetProjectionMatrix(aspect));
@@ -1233,7 +1377,7 @@ void Application::BuildAndExecuteRenderGraph(VkCommandBuffer cmd, uint32_t image
     ppDesc.hdrResource        = hdrRes;
     ppDesc.depthResource      = depthRes;
     ppDesc.swapchainResource  = swapRes;
-    ppDesc.forwardPassHandle  = forwardPassH;
+    ppDesc.forwardPassHandle  = (rtPassH != RenderGraph::INVALID_PASS) ? rtPassH : forwardPassH;
     ppDesc.stack              = &mPostProcess;
     ppDesc.swapchainView      = mSwapchain.GetImageViews()[imageIndex];
     ppDesc.depthView          = mDepthImage.GetView();
@@ -1356,6 +1500,17 @@ void Application::InitDebugUI() {
     uiState.gpuDriven        = mGPUDriven;
     uiState.occlusionCulling = mOcclusionCulling;
     uiState.occluderRatio    = mOccluderRatio;
+    uiState.sceneType        = mCurrentScene;
+    uiState.lightAzimuth     = mLightAzimuth;
+    uiState.lightElevation   = mLightElevation;
+    uiState.csmEnabled       = mCSMEnabled;
+    uiState.rtAvailable      = mRayTracingEnabled;
+    uiState.rtShadowsEnabled = mRTShadowsEnabled;
+    uiState.rtReflEnabled     = mRTReflEnabled;
+    uiState.rtShadowStrength  = mRTShadowStrength;
+    uiState.rtReflStrength    = mRTReflStrength;
+    uiState.rtReflRoughness   = mRTReflRoughness;
+    uiState.rtLightRadius     = mRTLightRadius;
 
     mGPUProfiler.Initialize(device, mDevice.GetPhysicalDevice(), FRAMES_IN_FLIGHT, 32);
     mPipelineStats.Initialize(device, FRAMES_IN_FLIGHT);
@@ -1389,6 +1544,21 @@ void Application::SyncUIState() {
 
     mPipelineStats.SetEnabled(uiState.pipelineStatsEnabled);
 
+    // Light direction and CSM
+    mLightAzimuth   = uiState.lightAzimuth;
+    mLightElevation = uiState.lightElevation;
+    mCSMEnabled     = uiState.csmEnabled;
+
+    // RT state sync
+    uiState.rtAvailable     = mRayTracingEnabled;
+    mRTShadowsEnabled       = uiState.rtShadowsEnabled;
+    mRTReflEnabled           = uiState.rtReflEnabled;
+    mRTShadowStrength        = uiState.rtShadowStrength;
+    mRTReflStrength          = uiState.rtReflStrength;
+    mRTReflRoughness         = uiState.rtReflRoughness;
+    mRTLightRadius           = uiState.rtLightRadius;
+    mRTDebugShadowVis        = uiState.rtDebugShadowVis;
+
     if (gpuChanged) {
         LOG_INFO("Render mode changed: GPU-driven={}, occlusion={}",
                  mGPUDriven, mOcclusionCulling);
@@ -1402,6 +1572,13 @@ void Application::SyncUIState() {
             mDevice.WaitIdle();
             mPostProcess.SetMSAASampleCount(mDevice.GetHandle(), mMemory.GetAllocator(), newSamples);
             RecreatePBRPipelines(newSamples);
+        }
+    }
+
+    if (uiState.sceneChanged) {
+        uiState.sceneChanged = false;
+        if (uiState.sceneType != mCurrentScene) {
+            ReloadScene(uiState.sceneType);
         }
     }
 }
@@ -1441,6 +1618,326 @@ void Application::ShutdownGPUDriven() {
     mIndirectRenderer.Shutdown(allocator);
 
     if (mShadowIndirectDescPool) { vkDestroyDescriptorPool(device, mShadowIndirectDescPool, nullptr); mShadowIndirectDescPool = VK_NULL_HANDLE; }
+}
+
+// =======================================================================
+// Ray Tracing (Phase 9)
+// =======================================================================
+void Application::InitRayTracing() {
+    if (!mDevice.IsRayTracingSupported() || mMeshPool.GetMeshCount() == 0) {
+        mRayTracingEnabled = false;
+        LOG_INFO("Ray tracing: disabled ({})", mDevice.IsRayTracingSupported() ? "no meshes" : "not supported");
+        return;
+    }
+
+    mRayTracingEnabled = true;
+    auto device    = mDevice.GetHandle();
+    auto allocator = mMemory.GetAllocator();
+    auto extent    = mSwapchain.GetExtent();
+
+    mAccelStructure.Initialize(device, allocator, mTransfer);
+    mAccelStructure.BuildBLAS(mMeshPool);
+    mRegistry.UpdateTransforms();
+    mAccelStructure.BuildTLAS(mRegistry, mMeshPool);
+
+    mRTShadows.Initialize(device, allocator, mShaders, extent.width, extent.height);
+    mRTReflections.Initialize(device, allocator, mShaders, extent.width, extent.height);
+
+    // Depth sampler for RT passes
+    VkSamplerCreateInfo samplerCI{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    samplerCI.magFilter    = VK_FILTER_NEAREST;
+    samplerCI.minFilter    = VK_FILTER_NEAREST;
+    samplerCI.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerCI.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VK_CHECK(vkCreateSampler(device, &samplerCI, nullptr, &mRTDepthSampler));
+
+    // Composite pipeline
+    {
+        VkDescriptorSetLayoutBinding bindings[3] = {};
+        bindings[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+        bindings[1] = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+        bindings[2] = {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+
+        VkDescriptorSetLayoutCreateInfo layoutCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        layoutCI.bindingCount = 3;
+        layoutCI.pBindings    = bindings;
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutCI, nullptr, &mRTCompositeDescLayout));
+
+        VkDescriptorPoolSize poolSizes[] = {
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
+        };
+        VkDescriptorPoolCreateInfo poolCI{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolCI.maxSets       = 1;
+        poolCI.poolSizeCount = 2;
+        poolCI.pPoolSizes    = poolSizes;
+        VK_CHECK(vkCreateDescriptorPool(device, &poolCI, nullptr, &mRTCompositeDescPool));
+
+        VkDescriptorSetAllocateInfo allocCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocCI.descriptorPool     = mRTCompositeDescPool;
+        allocCI.descriptorSetCount = 1;
+        allocCI.pSetLayouts        = &mRTCompositeDescLayout;
+        VK_CHECK(vkAllocateDescriptorSets(device, &allocCI, &mRTCompositeDescSet));
+
+        struct CompositePushConstants {
+            glm::uvec2 resolution;
+            float shadowStrength;
+            float reflectionStrength;
+            uint32_t enableShadows;
+            uint32_t enableReflections;
+            uint32_t debugShadowVis;
+        };
+        VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CompositePushConstants)};
+        VkPipelineLayoutCreateInfo pipeLayoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pipeLayoutCI.setLayoutCount         = 1;
+        pipeLayoutCI.pSetLayouts            = &mRTCompositeDescLayout;
+        pipeLayoutCI.pushConstantRangeCount = 1;
+        pipeLayoutCI.pPushConstantRanges    = &pcRange;
+        VK_CHECK(vkCreatePipelineLayout(device, &pipeLayoutCI, nullptr, &mRTCompositePipeLayout));
+
+        VkShaderModule mod = mShaders.GetOrLoad("shaders/rt_composite.comp.spv");
+        VkComputePipelineCreateInfo pipeCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeCI.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipeCI.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeCI.stage.module = mod;
+        pipeCI.stage.pName  = "main";
+        pipeCI.layout       = mRTCompositePipeLayout;
+        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeCI, nullptr, &mRTCompositePipeline));
+    }
+
+    mRTCompositeDescDirty = true;
+
+    LOG_INFO("Ray tracing initialized: BLAS {:.1f} KB, TLAS {:.1f} KB",
+             mAccelStructure.GetTotalBLASMemory() / 1024.0f,
+             mAccelStructure.GetTLASMemory() / 1024.0f);
+}
+
+void Application::ShutdownRayTracing() {
+    auto device    = mDevice.GetHandle();
+    auto allocator = mMemory.GetAllocator();
+
+    mRTShadows.Shutdown(device, allocator);
+    mRTReflections.Shutdown(device, allocator);
+    mAccelStructure.Shutdown(allocator);
+
+    if (mRTCompositePipeline)   vkDestroyPipeline(device, mRTCompositePipeline, nullptr);
+    if (mRTCompositePipeLayout) vkDestroyPipelineLayout(device, mRTCompositePipeLayout, nullptr);
+    if (mRTCompositeDescPool)   vkDestroyDescriptorPool(device, mRTCompositeDescPool, nullptr);
+    if (mRTCompositeDescLayout) vkDestroyDescriptorSetLayout(device, mRTCompositeDescLayout, nullptr);
+    if (mRTDepthSampler)        vkDestroySampler(device, mRTDepthSampler, nullptr);
+
+    mRTCompositePipeline   = VK_NULL_HANDLE;
+    mRTCompositePipeLayout = VK_NULL_HANDLE;
+    mRTCompositeDescPool   = VK_NULL_HANDLE;
+    mRTCompositeDescLayout = VK_NULL_HANDLE;
+    mRTDepthSampler        = VK_NULL_HANDLE;
+}
+
+// =======================================================================
+// Scene management (switching)
+// =======================================================================
+void Application::ClearScene() {
+    auto device    = mDevice.GetHandle();
+    auto allocator = mMemory.GetAllocator();
+
+    ShutdownRayTracing();
+    ShutdownGPUDriven();
+
+    mMeshPool.Destroy(allocator);
+
+    for (auto& tex : mGPUTextures)
+        tex.Destroy(allocator, device);
+    mGPUTextures.clear();
+
+    for (uint32_t idx : mTextureDescriptorIndices)
+        mDescriptors.FreeTextureIndex(idx);
+    mTextureDescriptorIndices.clear();
+
+    mGPUMaterials.clear();
+    mMaterialSSBO.Destroy(allocator);
+
+    mRegistry.Clear();
+    mSunEntity = INVALID_ENTITY;
+    mModelData = ModelData{};
+    mRayTracingEnabled = false;
+}
+
+void Application::LoadTestScene() {
+    auto device    = mDevice.GetHandle();
+    auto allocator = mMemory.GetAllocator();
+
+    // --- Sun light (side-front for clear shadow patterns) ---
+    mSunEntity = mRegistry.CreateEntity();
+    mRegistry.AddTransform(mSunEntity);
+    auto& sunLight = mRegistry.AddLight(mSunEntity);
+    sunLight.direction = glm::normalize(glm::vec3(-0.5f, -0.7f, -0.3f));
+    sunLight.color     = glm::vec3(1.0f, 0.97f, 0.9f);
+    sunLight.intensity = 4.0f;
+
+    // --- Checker texture for ground ---
+    constexpr uint32_t texW = 512, texH = 512, tileSize = 32;
+    std::vector<uint8_t> checkerPixels(texW * texH * 4);
+    for (uint32_t y = 0; y < texH; y++) {
+        for (uint32_t x = 0; x < texW; x++) {
+            bool white = ((x / tileSize) + (y / tileSize)) % 2 == 0;
+            uint8_t c  = white ? 200 : 80;
+            uint32_t idx = (y * texW + x) * 4;
+            checkerPixels[idx + 0] = c;
+            checkerPixels[idx + 1] = c;
+            checkerPixels[idx + 2] = c;
+            checkerPixels[idx + 3] = 255;
+        }
+    }
+    VulkanImage checkerImg;
+    checkerImg.CreateTexture2D(allocator, device, mTransfer,
+                               texW, texH, VK_FORMAT_R8G8B8A8_SRGB, checkerPixels.data());
+    uint32_t checkerDescIdx = mDescriptors.AllocateTextureIndex();
+    mDescriptors.UpdateTexture(device, checkerDescIdx, checkerImg.GetView(),
+                               mDescriptors.GetDefaultSampler());
+    mGPUTextures.push_back(std::move(checkerImg));
+    mTextureDescriptorIndices.push_back(checkerDescIdx);
+
+    // --- Meshes ---
+    // 0: large ground plane
+    {
+        MeshData mesh;
+        ModelLoader::GenerateGroundPlane(mesh, 30.0f);
+        mModelData.meshes.push_back(std::move(mesh));
+    }
+    // 1: sphere
+    {
+        MeshData mesh;
+        ModelLoader::GenerateUVSphere(mesh, 1.0f, 64, 32);
+        mModelData.meshes.push_back(std::move(mesh));
+    }
+    // 2: cube
+    {
+        ModelData cubeData;
+        ModelLoader::GenerateProceduralCube(cubeData);
+        mModelData.meshes.push_back(std::move(cubeData.meshes[0]));
+    }
+    // 3: small mirror plane
+    {
+        MeshData mesh;
+        ModelLoader::GenerateGroundPlane(mesh, 4.0f);
+        mModelData.meshes.push_back(std::move(mesh));
+    }
+
+    // --- Materials ---
+    auto pushMat = [&](glm::vec3 color, float metallic, float roughness, uint32_t baseTexIdx) {
+        GPUMaterialData m{};
+        m.baseColorFactor         = glm::vec4(color, 1.0f);
+        m.metallicFactor          = metallic;
+        m.roughnessFactor         = roughness;
+        m.baseColorTexIdx         = baseTexIdx;
+        m.normalTexIdx            = mDefaultNormalDescIdx;
+        m.metallicRoughnessTexIdx = mWhiteTexDescIdx;
+        m.aoTexIdx                = mWhiteTexDescIdx;
+        m.emissiveTexIdx          = mBlackTexDescIdx;
+        mGPUMaterials.push_back(m);
+    };
+    // 0: ground (checker, non-metallic, medium roughness)
+    pushMat({0.6f, 0.6f, 0.6f}, 0.0f, 0.8f, checkerDescIdx);
+    // 1: shiny metallic copper sphere
+    pushMat({0.955f, 0.638f, 0.538f}, 1.0f, 0.25f, mWhiteTexDescIdx);
+    // 2: rough red plastic sphere
+    pushMat({0.8f, 0.1f, 0.08f}, 0.0f, 0.7f, mWhiteTexDescIdx);
+    // 3: blue cube (dielectric, medium roughness)
+    pushMat({0.1f, 0.2f, 0.85f}, 0.0f, 0.5f, mWhiteTexDescIdx);
+    // 4: wood sphere (dielectric, medium-high roughness)
+    pushMat({0.55f, 0.35f, 0.18f}, 0.0f, 0.65f, mWhiteTexDescIdx);
+    // 7: smooth green plastic sphere
+    pushMat({0.1f, 0.75f, 0.15f}, 0.0f, 0.15f, mWhiteTexDescIdx);
+    // 5: mirror floor (metallic, very smooth)
+    pushMat({0.6f, 0.1f, 0.6f}, 1.0f, 0.02f, mWhiteTexDescIdx);
+    // 6: white wall / tall pillar (dielectric)
+    pushMat({0.9f, 0.88f, 0.85f}, 0.0f, 0.7f, mWhiteTexDescIdx);
+
+    // --- Entities ---
+    auto makeObj = [&](int meshIdx, int matIdx, glm::vec3 pos, glm::vec3 scale = glm::vec3(1.0f)) {
+        Entity e = mRegistry.CreateEntity();
+        auto& tc = mRegistry.AddTransform(e);
+        tc.localPosition = pos;
+        tc.localScale    = scale;
+        mRegistry.AddMesh(e).meshIndex = meshIdx;
+        mRegistry.AddMaterial(e).materialIndex = matIdx;
+    };
+
+    // Ground
+    makeObj(0, 0, {0.0f, 0.0f, 0.0f});
+    // Shiny copper sphere (center, floating for clear shadow)
+    makeObj(1, 1, {0.0f, 1.5f, 0.0f});
+    // Rough red plastic sphere (right side)
+    makeObj(1, 2, {4.0f, 1.0f, -2.0f});
+    // Blue cube (left side, tall for clear rectangular shadow)
+    makeObj(2, 3, {-4.0f, 1.5f, -1.0f}, {1.5f, 3.0f, 1.5f});
+    // Wood sphere (front-right)
+    makeObj(1, 4, {2.0f, 0.8f, 3.0f}, {0.8f, 0.8f, 0.8f});
+    // Mirror floor patch (slightly elevated to avoid z-fighting)
+    makeObj(3, 5, {0.0f, 0.02f, 4.0f});
+    // White pillar (back, tall shadow caster)
+    makeObj(2, 6, {-2.0f, 2.0f, -5.0f}, {1.0f, 4.0f, 1.0f});
+    // Smooth green plastic sphere near mirror plane
+    makeObj(1, 7, {1.0f, 0.6f, 4.5f}, {0.6f, 0.6f, 0.6f});
+
+    // --- Upload scene data ---
+    mMaterialSSBO.CreateDeviceLocal(allocator, mTransfer,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        mGPUMaterials.data(), mGPUMaterials.size() * sizeof(GPUMaterialData));
+
+    if (mDevice.IsRayTracingSupported()) {
+        mMeshPool.Upload(allocator, mTransfer, mModelData.meshes,
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    } else {
+        mMeshPool.Upload(allocator, mTransfer, mModelData.meshes);
+    }
+
+    mModelData = ModelData{};
+
+    LOG_INFO("Test scene loaded: {} meshes, {} materials, {} entities",
+             mMeshPool.GetMeshCount(), mGPUMaterials.size(), mRegistry.EntityCount());
+}
+
+void Application::ReloadScene(SceneType newType) {
+    mDevice.WaitIdle();
+    mCurrentScene = newType;
+
+    ClearScene();
+
+    if (newType == SceneType::TestScene) {
+        LoadTestScene();
+    } else {
+        LoadScene();
+    }
+
+    // Update material SSBO binding in frame descriptor sets
+    for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; i++) {
+        VkDescriptorBufferInfo matInfo{mMaterialSSBO.GetHandle(), 0, mMaterialSSBO.GetSize()};
+        VkWriteDescriptorSet write{};
+        write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet          = mFrameDescSets[i];
+        write.dstBinding      = 1;
+        write.descriptorCount = 1;
+        write.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo     = &matInfo;
+        vkUpdateDescriptorSets(mDevice.GetHandle(), 1, &write, 0, nullptr);
+    }
+
+    mGPUDriven = true;
+    InitGPUDriven();
+    InitRayTracing();
+
+    // Reset camera for test scene
+    if (newType == SceneType::TestScene) {
+        mCamera.Init(glm::vec3(0.0f, 6.0f, 12.0f), glm::vec3(0.0f, 0.0f, 0.0f), 45.0f, 0.01f, 100.0f);
+    } else {
+        mCamera.Init(glm::vec3(0, 1.6f, 0), glm::vec3(0, 1.6f, -1.0f), 45.0f, 0.01f, 100.0f);
+    }
+
+    LOG_INFO("Scene switched to: {}", newType == SceneType::TestScene ? "Test Scene" : "Sponza");
 }
 
 // =======================================================================
@@ -1497,6 +1994,13 @@ void Application::RecreateSwapchain() {
         mPostProcess.Resize(mDevice.GetHandle(), mMemory.GetAllocator(), extent.width, extent.height);
     }
 
+    if (mRayTracingEnabled) {
+        auto extent = mSwapchain.GetExtent();
+        mRTShadows.Resize(mDevice.GetHandle(), mMemory.GetAllocator(), extent.width, extent.height);
+        mRTReflections.Resize(mDevice.GetHandle(), mMemory.GetAllocator(), extent.width, extent.height);
+        mRTCompositeDescDirty = true;
+    }
+
     LOG_INFO("Swapchain recreated (MSAA: {}x)", static_cast<int>(mCurrentMSAA));
 }
 
@@ -1524,6 +2028,7 @@ void Application::CleanupVulkan() {
 
     mPostProcess.Shutdown(device, allocator);
 
+    ShutdownRayTracing();
     ShutdownGPUDriven();
 
     mMeshPool.Destroy(allocator);

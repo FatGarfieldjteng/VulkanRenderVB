@@ -29,6 +29,8 @@ public:
 
     const QueueFamilyIndices& GetQueueFamilyIndices() const { return mQueueFamilyIndices; }
 
+    bool IsRayTracingSupported() const { return mRayTracingSupported; }
+
     void WaitIdle() const;
 
 private:
@@ -36,6 +38,7 @@ private:
     void CreateLogicalDevice();
     QueueFamilyIndices FindQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR surface) const;
     bool CheckDeviceExtensionSupport(VkPhysicalDevice device) const;
+    bool CheckRayTracingSupport(VkPhysicalDevice device) const;
 
     VkPhysicalDevice   mPhysicalDevice = VK_NULL_HANDLE;
     VkDevice           mDevice         = VK_NULL_HANDLE;
@@ -47,4 +50,5 @@ private:
 
     QueueFamilyIndices mQueueFamilyIndices;
     VkSurfaceKHR       mSurface = VK_NULL_HANDLE;
+    bool               mRayTracingSupported = false;
 };

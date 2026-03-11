@@ -21,6 +21,7 @@ public:
         const Registry*        registry;
         const MeshPool*        meshPool                   = nullptr;
 
+        bool                   skip                       = false;
         bool                   gpuDriven                  = false;
         VkPipeline             indirectPipeline           = VK_NULL_HANDLE;
         VkPipelineLayout       indirectPipelineLayout     = VK_NULL_HANDLE;

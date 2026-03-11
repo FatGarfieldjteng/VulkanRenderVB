@@ -28,6 +28,10 @@ public:
     uint32_t    GetWidth()     const { return mWidth; }
     uint32_t    GetHeight()    const { return mHeight; }
 
+    void SetHandles(VkImage image, VkImageView view, VmaAllocation alloc) {
+        mImage = image; mView = view; mAllocation = alloc;
+    }
+
 private:
     void GenerateMipmaps(const TransferManager& transfer, VkFormat format);
 

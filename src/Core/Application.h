@@ -33,6 +33,9 @@
 #include "VisualUI/GPUProfiler.h"
 #include "VisualUI/DebugVisualization.h"
 #include "VisualUI/PipelineStatistics.h"
+#include "RayTracing/AccelStructure.h"
+#include "RayTracing/RTShadows.h"
+#include "RayTracing/RTReflections.h"
 
 #include <string>
 #include <vector>
@@ -61,6 +64,10 @@ private:
     void InitGPUDriven();
     void ShutdownGPUDriven();
     void ExtractFrustumPlanes(const glm::mat4& vp, glm::vec4 planes[6]);
+
+    void ClearScene();
+    void LoadTestScene();
+    void ReloadScene(SceneType newType);
 
     void InitDebugUI();
     void ShutdownDebugUI();
@@ -98,6 +105,9 @@ private:
     Entity           mSunEntity = INVALID_ENTITY;
     CascadedShadowMap mCSM;
     IBLProcessor      mIBL;
+    float            mLightAzimuth   = 53.0f;
+    float            mLightElevation = 58.0f;
+    bool             mCSMEnabled     = true;
 
     // --- depth ---
     VulkanImage mDepthImage;
@@ -156,6 +166,31 @@ private:
     // --- Post-processing (Phase 8) ---
     PostProcessStack mPostProcess;
 
+    // --- Ray Tracing (Phase 9) ---
+    bool             mRayTracingEnabled = false;
+    bool             mRTShadowsEnabled  = true;
+    bool             mRTReflEnabled     = true;
+    float            mRTShadowStrength  = 1.0f;
+    float            mRTReflStrength    = 0.5f;
+    float            mRTReflRoughness   = 0.15f;
+    float            mRTLightRadius     = 0.02f;
+    bool             mRTDebugShadowVis = false;
+    AccelStructure   mAccelStructure;
+    RTShadows        mRTShadows;
+    RTReflections    mRTReflections;
+
+
+    VkPipeline       mRTCompositePipeline    = VK_NULL_HANDLE;
+    VkPipelineLayout mRTCompositePipeLayout  = VK_NULL_HANDLE;
+    VkDescriptorSetLayout mRTCompositeDescLayout = VK_NULL_HANDLE;
+    VkDescriptorPool mRTCompositeDescPool    = VK_NULL_HANDLE;
+    VkDescriptorSet  mRTCompositeDescSet     = VK_NULL_HANDLE;
+    VkSampler        mRTDepthSampler         = VK_NULL_HANDLE;
+    bool             mRTCompositeDescDirty   = true;
+
+    void InitRayTracing();
+    void ShutdownRayTracing();
+
     // --- MSAA ---
     std::vector<VkSampleCountFlagBits> mSupportedMSAA;
     VkSampleCountFlagBits mCurrentMSAA = VK_SAMPLE_COUNT_1_BIT;
@@ -187,4 +222,5 @@ private:
 
     // --- scene override ---
     std::string mScenePathOverride;
+    SceneType   mCurrentScene = SceneType::TestScene;
 };

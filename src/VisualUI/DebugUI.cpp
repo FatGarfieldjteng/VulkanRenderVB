@@ -188,6 +188,26 @@ void DebugUI::DrawRenderSettingsPanel(float deltaTime, const std::vector<VkSampl
     ImGui::PlotLines("##fps", mFpsHistory, 120, mFpsHistoryOffset, nullptr, 0.0f, 240.0f, ImVec2(0, 50));
 
     ImGui::Separator();
+    ImGui::Text("Scene");
+    {
+        const char* sceneNames[] = { "Sponza", "Test Scene" };
+        int sceneIdx = static_cast<int>(mState.sceneType);
+        if (ImGui::Combo("Scene", &sceneIdx, sceneNames, 2)) {
+            auto newType = static_cast<SceneType>(sceneIdx);
+            if (newType != mState.sceneType) {
+                mState.sceneType    = newType;
+                mState.sceneChanged = true;
+            }
+        }
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Lighting");
+    ImGui::SliderFloat("Light Azimuth", &mState.lightAzimuth, 0.0f, 360.0f, "%.1f deg");
+    ImGui::SliderFloat("Light Elevation", &mState.lightElevation, 5.0f, 90.0f, "%.1f deg");
+    ImGui::Checkbox("CSM Shadows", &mState.csmEnabled);
+
+    ImGui::Separator();
     ImGui::Text("GPU-Driven Rendering");
     ImGui::Checkbox("GPU Driven", &mState.gpuDriven);
     ImGui::Checkbox("Occlusion Culling", &mState.occlusionCulling);
@@ -224,6 +244,18 @@ void DebugUI::DrawRenderSettingsPanel(float deltaTime, const std::vector<VkSampl
             }
             ImGui::EndCombo();
         }
+    }
+
+    if (mState.rtAvailable) {
+        ImGui::Separator();
+        ImGui::Text("Ray Tracing");
+        ImGui::Checkbox("RT Shadows", &mState.rtShadowsEnabled);
+        ImGui::Checkbox("RT Reflections", &mState.rtReflEnabled);
+        ImGui::SliderFloat("Shadow Strength", &mState.rtShadowStrength, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Reflection Strength", &mState.rtReflStrength, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Reflection Roughness", &mState.rtReflRoughness, 0.01f, 1.0f, "%.3f");
+        ImGui::SliderFloat("Light Radius (soft shadow)", &mState.rtLightRadius, 0.0f, 0.2f, "%.3f");
+        ImGui::Checkbox("Debug Shadow Map", &mState.rtDebugShadowVis);
     }
 
     ImGui::Separator();

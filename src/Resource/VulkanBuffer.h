@@ -31,6 +31,13 @@ public:
     VkDeviceSize GetSize()       const { return mSize; }
     void*        GetMappedData() const { return mMappedData; }
 
+    VkDeviceAddress GetDeviceAddress(VkDevice device) const {
+        VkBufferDeviceAddressInfo info{};
+        info.sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+        info.buffer = mBuffer;
+        return vkGetBufferDeviceAddress(device, &info);
+    }
+
 private:
     VkBuffer      mBuffer     = VK_NULL_HANDLE;
     VmaAllocation mAllocation = VK_NULL_HANDLE;

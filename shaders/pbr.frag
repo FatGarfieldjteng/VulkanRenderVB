@@ -164,7 +164,7 @@ void main() {
     vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
     vec3 diffuse = kD * albedo / PI;
 
-    float shadow = ComputeShadow(fragWorldPos);
+    float shadow = (frame.sunDirection.w > 0.5) ? ComputeShadow(fragWorldPos) : 1.0;
     vec3 radiance = frame.sunColor.rgb * frame.sunColor.w;
     vec3 Lo = (diffuse + specular) * radiance * NdotL * shadow;
 

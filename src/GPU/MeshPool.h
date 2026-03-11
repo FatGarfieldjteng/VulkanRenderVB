@@ -17,6 +17,7 @@ struct MeshDrawCommand {
     uint32_t firstIndex;
     int32_t  vertexOffset;
     uint32_t firstInstance;
+    uint32_t vertexCount;
     uint32_t materialIndex;
     AABB     bounds;
 };
@@ -26,7 +27,9 @@ class TransferManager;
 class MeshPool {
 public:
     void Upload(VmaAllocator allocator, const TransferManager& transfer,
-                const std::vector<MeshData>& meshes);
+                const std::vector<MeshData>& meshes,
+                VkBufferUsageFlags extraVertexFlags = 0,
+                VkBufferUsageFlags extraIndexFlags = 0);
     void Destroy(VmaAllocator allocator);
 
     VkBuffer GetVertexBuffer() const { return mVertexBuffer.GetHandle(); }

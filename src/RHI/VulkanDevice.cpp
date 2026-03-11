@@ -9,6 +9,12 @@ static const std::vector<const char*> kRequiredDeviceExtensions = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 };
 
+static const std::vector<const char*> kRayTracingExtensions = {
+    VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+    VK_KHR_RAY_QUERY_EXTENSION_NAME,
+    VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+};
+
 void VulkanDevice::Initialize(VkInstance instance, VkSurfaceKHR surface) {
     mSurface = surface;
     PickPhysicalDevice(instance, surface);
@@ -73,6 +79,7 @@ void VulkanDevice::PickPhysicalDevice(VkInstance instance, VkSurfaceKHR surface)
 
     mPhysicalDevice    = bestDevice;
     mQueueFamilyIndices = FindQueueFamilies(mPhysicalDevice, surface);
+    mRayTracingSupported = CheckRayTracingSupport(mPhysicalDevice);
 
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(mPhysicalDevice, &props);
@@ -81,6 +88,7 @@ void VulkanDevice::PickPhysicalDevice(VkInstance instance, VkSurfaceKHR surface)
     LOG_INFO("  Present  queue family: {}", mQueueFamilyIndices.presentFamily);
     LOG_INFO("  Transfer queue family: {}", mQueueFamilyIndices.transferFamily);
     LOG_INFO("  Compute  queue family: {}", mQueueFamilyIndices.computeFamily);
+    LOG_INFO("  Ray tracing support:   {}", mRayTracingSupported ? "YES" : "NO");
 }
 
 void VulkanDevice::CreateLogicalDevice() {
@@ -102,10 +110,20 @@ void VulkanDevice::CreateLogicalDevice() {
         queueCreateInfos.push_back(queueInfo);
     }
 
+    VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{};
+    rayQueryFeatures.sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    rayQueryFeatures.rayQuery = VK_TRUE;
+
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR accelFeatures{};
+    accelFeatures.sType                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    accelFeatures.accelerationStructure = VK_TRUE;
+    accelFeatures.pNext                 = &rayQueryFeatures;
+
     VkPhysicalDeviceVulkan13Features features13{};
     features13.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     features13.dynamicRendering = VK_TRUE;
     features13.synchronization2 = VK_TRUE;
+    features13.pNext            = mRayTracingSupported ? (void*)&accelFeatures : nullptr;
 
     VkPhysicalDeviceVulkan12Features features12{};
     features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
@@ -126,6 +144,7 @@ void VulkanDevice::CreateLogicalDevice() {
     features12.descriptorBindingVariableDescriptorCount    = VK_TRUE;
     features12.drawIndirectCount                           = VK_TRUE;
     features12.samplerFilterMinmax                         = VK_TRUE;
+    features12.bufferDeviceAddress                         = VK_TRUE;
 
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -136,13 +155,19 @@ void VulkanDevice::CreateLogicalDevice() {
     features2.features.wideLines              = VK_TRUE;
     features2.features.sampleRateShading      = VK_TRUE;
 
+    std::vector<const char*> enabledExtensions(kRequiredDeviceExtensions);
+    if (mRayTracingSupported) {
+        enabledExtensions.insert(enabledExtensions.end(),
+                                 kRayTracingExtensions.begin(), kRayTracingExtensions.end());
+    }
+
     VkDeviceCreateInfo createInfo{};
     createInfo.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     createInfo.pNext                   = &features2;
     createInfo.queueCreateInfoCount    = static_cast<uint32_t>(queueCreateInfos.size());
     createInfo.pQueueCreateInfos       = queueCreateInfos.data();
-    createInfo.enabledExtensionCount   = static_cast<uint32_t>(kRequiredDeviceExtensions.size());
-    createInfo.ppEnabledExtensionNames = kRequiredDeviceExtensions.data();
+    createInfo.enabledExtensionCount   = static_cast<uint32_t>(enabledExtensions.size());
+    createInfo.ppEnabledExtensionNames = enabledExtensions.data();
 
     VK_CHECK(vkCreateDevice(mPhysicalDevice, &createInfo, nullptr, &mDevice));
     volkLoadDevice(mDevice);
@@ -193,6 +218,32 @@ QueueFamilyIndices VulkanDevice::FindQueueFamilies(VkPhysicalDevice device, VkSu
     if (indices.computeFamily  == UINT32_MAX) indices.computeFamily  = indices.graphicsFamily;
 
     return indices;
+}
+
+bool VulkanDevice::CheckRayTracingSupport(VkPhysicalDevice device) const {
+    uint32_t extCount = 0;
+    vkEnumerateDeviceExtensionProperties(device, nullptr, &extCount, nullptr);
+    std::vector<VkExtensionProperties> available(extCount);
+    vkEnumerateDeviceExtensionProperties(device, nullptr, &extCount, available.data());
+
+    std::set<std::string> required(kRayTracingExtensions.begin(), kRayTracingExtensions.end());
+    for (const auto& ext : available)
+        required.erase(ext.extensionName);
+
+    if (!required.empty())
+        return false;
+
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeatures{};
+    asFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    VkPhysicalDeviceRayQueryFeaturesKHR rqFeatures{};
+    rqFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    rqFeatures.pNext = &asFeatures;
+    VkPhysicalDeviceFeatures2 feats2{};
+    feats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    feats2.pNext = &rqFeatures;
+    vkGetPhysicalDeviceFeatures2(device, &feats2);
+
+    return asFeatures.accelerationStructure && rqFeatures.rayQuery;
 }
 
 bool VulkanDevice::CheckDeviceExtensionSupport(VkPhysicalDevice device) const {

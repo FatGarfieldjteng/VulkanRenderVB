@@ -12,6 +12,8 @@ void ShadowPass::Setup(RenderGraph& graph, PassHandle self) {
 }
 
 void ShadowPass::Execute(VkCommandBuffer cmd) {
+    if (mDesc.skip) return;
+
     constexpr uint32_t SD = CascadedShadowMap::SHADOW_DIM;
     constexpr uint32_t CC = CascadedShadowMap::CASCADE_COUNT;
 

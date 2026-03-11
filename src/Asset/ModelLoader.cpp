@@ -598,6 +598,49 @@ void ModelLoader::GenerateGroundPlane(MeshData& outMesh, float halfSize) {
     outMesh.indices = { 0, 2, 1, 0, 3, 2 };
 }
 
+void ModelLoader::GenerateUVSphere(MeshData& outMesh, float radius,
+                                    uint32_t sectors, uint32_t stacks) {
+    outMesh.vertices.clear();
+    outMesh.indices.clear();
+
+    const float PI = 3.14159265358979323846f;
+
+    for (uint32_t i = 0; i <= stacks; i++) {
+        float stackAngle = PI / 2.0f - float(i) * PI / float(stacks);
+        float xy = radius * cosf(stackAngle);
+        float z  = radius * sinf(stackAngle);
+
+        for (uint32_t j = 0; j <= sectors; j++) {
+            float sectorAngle = 2.0f * PI * float(j) / float(sectors);
+
+            MeshVertex v{};
+            v.position = glm::vec3(xy * cosf(sectorAngle), z, xy * sinf(sectorAngle));
+            v.normal   = glm::normalize(v.position);
+            v.texCoord = glm::vec2(float(j) / sectors, float(i) / stacks);
+            v.tangent  = glm::vec4(
+                -sinf(sectorAngle), 0.0f, cosf(sectorAngle), 1.0f);
+            outMesh.vertices.push_back(v);
+        }
+    }
+
+    for (uint32_t i = 0; i < stacks; i++) {
+        uint32_t k1 = i * (sectors + 1);
+        uint32_t k2 = k1 + sectors + 1;
+        for (uint32_t j = 0; j < sectors; j++, k1++, k2++) {
+            if (i != 0) {
+                outMesh.indices.push_back(k1);
+                outMesh.indices.push_back(k2);
+                outMesh.indices.push_back(k1 + 1);
+            }
+            if (i != stacks - 1) {
+                outMesh.indices.push_back(k1 + 1);
+                outMesh.indices.push_back(k2);
+                outMesh.indices.push_back(k2 + 1);
+            }
+        }
+    }
+}
+
 void ModelLoader::SortMeshesByVolume(std::vector<MeshData>& meshes) {
     if (meshes.empty()) return;
 

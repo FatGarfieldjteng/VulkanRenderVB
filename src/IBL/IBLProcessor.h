@@ -17,6 +17,7 @@ public:
 
     void Shutdown(VmaAllocator allocator, VkDevice device);
 
+    VkImageView GetEnvCubeView()     const { return mEnvCubeView; }
     VkImageView GetIrradianceView() const { return mIrradianceCubeView; }
     VkImageView GetPrefilterView()  const { return mPrefilterCubeView; }
     VkImageView GetBRDFLutView()    const { return mBRDFLutView; }

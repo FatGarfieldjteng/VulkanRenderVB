@@ -10,6 +10,8 @@
 #include "RenderGraph/Passes/OcclusionTestPass.h"
 #include "RenderGraph/Passes/PostProcessPass.h"
 #include "RenderGraph/Passes/RayTracingPass.h"
+#include "RenderGraph/Passes/PathTracingPass.h"
+#include "RenderGraph/Passes/HybridRTPass.h"
 #include "GPU/MeshPool.h"
 #include "GPU/IndirectRenderer.h"
 #include "GPU/HiZBuffer.h"
@@ -34,9 +36,25 @@
 #include <memory>
 
 // =======================================================================
+Application::~Application() = default;
+
 void Application::Run() {
     InitWindow();
     InitVulkan();
+
+    if (mInitialRenderMode.has_value() || mInitialDenoiser.has_value()) {
+        if (mInitialRenderMode.has_value()) {
+            mActiveRenderMode = *mInitialRenderMode;
+            auto& uiState = mDebugUI.GetState();
+            uiState.renderMode = *mInitialRenderMode;
+            if (mInitialDenoiser.has_value())
+                uiState.ptEnableDenoiser = *mInitialDenoiser;
+            RebuildRenderGraphForMode(*mInitialRenderMode);
+        } else if (mInitialDenoiser.has_value()) {
+            mDebugUI.GetState().ptEnableDenoiser = *mInitialDenoiser;
+        }
+    }
+
     MainLoop();
     CleanupVulkan();
 }
@@ -508,9 +526,11 @@ void Application::LoadScene() {
     if (mDevice.IsRayTracingSupported()) {
         mMeshPool.Upload(allocator, mTransfer, mModelData.meshes,
             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     } else {
         mMeshPool.Upload(allocator, mTransfer, mModelData.meshes);
     }
@@ -1238,85 +1258,247 @@ void Application::BuildAndExecuteRenderGraph(VkCommandBuffer cmd, uint32_t image
         }
     }
 
-    ShadowPass::Desc shadowDesc{};
-    shadowDesc.csmResource   = csmRes;
-    shadowDesc.csm           = &mCSM;
-    shadowDesc.skip          = !mCSMEnabled;
-    shadowDesc.pipeline      = mShadowPipeline;
-    shadowDesc.pipelineLayout = mShadowPipelineLayout;
-    shadowDesc.registry      = &mRegistry;
-    shadowDesc.meshPool      = &mMeshPool;
-    if (useGPU) {
-        shadowDesc.gpuDriven                  = true;
-        shadowDesc.indirectPipeline           = mShadowIndirectPipeline;
-        shadowDesc.indirectPipelineLayout     = mShadowIndirectPipelineLayout;
-        shadowDesc.indirectDescSet            = mShadowIndirectDescSet;
-        shadowDesc.indirectBuffer             = mIndirectRenderer.GetIndirectBuffer();
-        shadowDesc.countBuffer                = mIndirectRenderer.GetCountBuffer();
-        shadowDesc.maxDrawCount               = mIndirectRenderer.GetDrawCount();
+    const auto& uiSplit = mDebugUI.GetState();
+    bool splitEnabled = uiSplit.splitScreenEnabled && mRTPipelineSupported;
+    bool needsRasterPasses = (mActiveRenderMode != DebugUIState::RenderMode::FullPathTracing)
+                             || splitEnabled;
+
+    RenderGraph::PassHandle shadowPassH  = RenderGraph::INVALID_PASS;
+    RenderGraph::PassHandle forwardPassH = RenderGraph::INVALID_PASS;
+
+    if (needsRasterPasses) {
+        ShadowPass::Desc shadowDesc{};
+        shadowDesc.csmResource   = csmRes;
+        shadowDesc.csm           = &mCSM;
+        shadowDesc.skip          = !mCSMEnabled;
+        shadowDesc.pipeline      = mShadowPipeline;
+        shadowDesc.pipelineLayout = mShadowPipelineLayout;
+        shadowDesc.registry      = &mRegistry;
+        shadowDesc.meshPool      = &mMeshPool;
+        if (useGPU) {
+            shadowDesc.gpuDriven                  = true;
+            shadowDesc.indirectPipeline           = mShadowIndirectPipeline;
+            shadowDesc.indirectPipelineLayout     = mShadowIndirectPipelineLayout;
+            shadowDesc.indirectDescSet            = mShadowIndirectDescSet;
+            shadowDesc.indirectBuffer             = mIndirectRenderer.GetIndirectBuffer();
+            shadowDesc.countBuffer                = mIndirectRenderer.GetCountBuffer();
+            shadowDesc.maxDrawCount               = mIndirectRenderer.GetDrawCount();
+        }
+        shadowPassH = mRenderGraph.AddPass(std::make_unique<ShadowPass>(shadowDesc));
     }
-    auto shadowPassH = mRenderGraph.AddPass(std::make_unique<ShadowPass>(shadowDesc));
 
     auto hdrRes = mRenderGraph.AddImage("HDRColor",
         mPostProcess.GetHDRImage(), mPostProcess.GetHDRView(),
         VK_IMAGE_LAYOUT_UNDEFINED);
 
-    ForwardPass::Desc fwdDesc{};
-    fwdDesc.csmResource        = csmRes;
-    fwdDesc.depthResource      = depthRes;
-    fwdDesc.colorResource      = hdrRes;
-    fwdDesc.shadowPassHandle   = shadowPassH;
-    fwdDesc.extent             = extent;
-    fwdDesc.colorView          = mPostProcess.GetHDRView();
-    fwdDesc.depthView          = mDepthImage.GetView();
-    fwdDesc.pipeline           = mPBRPipeline;
-    fwdDesc.pipelineLayout     = mPBRPipelineLayout;
-    fwdDesc.bindlessSet        = mDescriptors.GetSet();
-    fwdDesc.frameDescSet       = mFrameDescSets[mFrameIndex];
-    fwdDesc.registry           = &mRegistry;
-    fwdDesc.meshPool           = &mMeshPool;
-    fwdDesc.gpuMaterials       = &mGPUMaterials;
-    if (mCurrentMSAA != VK_SAMPLE_COUNT_1_BIT && mPostProcess.GetMSAAColorView()) {
-        fwdDesc.msaaSamples       = mCurrentMSAA;
-        fwdDesc.msaaColorImage    = mPostProcess.GetMSAAColorImage();
-        fwdDesc.msaaColorView     = mPostProcess.GetMSAAColorView();
-        fwdDesc.msaaDepthImage    = mPostProcess.GetMSAADepthImage();
-        fwdDesc.msaaDepthView     = mPostProcess.GetMSAADepthView();
-        fwdDesc.resolveColorView  = mPostProcess.GetHDRView();
-        fwdDesc.resolveDepthImage = mDepthImage.GetImage();
-        fwdDesc.resolveDepthView  = mDepthImage.GetView();
+    if (needsRasterPasses) {
+        ForwardPass::Desc fwdDesc{};
+        fwdDesc.csmResource        = csmRes;
+        fwdDesc.depthResource      = depthRes;
+        fwdDesc.colorResource      = hdrRes;
+        fwdDesc.shadowPassHandle   = shadowPassH;
+        fwdDesc.extent             = extent;
+        fwdDesc.colorView          = mPostProcess.GetHDRView();
+        fwdDesc.depthView          = mDepthImage.GetView();
+        fwdDesc.pipeline           = mPBRPipeline;
+        fwdDesc.pipelineLayout     = mPBRPipelineLayout;
+        fwdDesc.bindlessSet        = mDescriptors.GetSet();
+        fwdDesc.frameDescSet       = mFrameDescSets[mFrameIndex];
+        fwdDesc.registry           = &mRegistry;
+        fwdDesc.meshPool           = &mMeshPool;
+        fwdDesc.gpuMaterials       = &mGPUMaterials;
+        if (mCurrentMSAA != VK_SAMPLE_COUNT_1_BIT && mPostProcess.GetMSAAColorView()) {
+            fwdDesc.msaaSamples       = mCurrentMSAA;
+            fwdDesc.msaaColorImage    = mPostProcess.GetMSAAColorImage();
+            fwdDesc.msaaColorView     = mPostProcess.GetMSAAColorView();
+            fwdDesc.msaaDepthImage    = mPostProcess.GetMSAADepthImage();
+            fwdDesc.msaaDepthView     = mPostProcess.GetMSAADepthView();
+            fwdDesc.resolveColorView  = mPostProcess.GetHDRView();
+            fwdDesc.resolveDepthImage = mDepthImage.GetImage();
+            fwdDesc.resolveDepthView  = mDepthImage.GetView();
+        }
+        if (useGPU) {
+            fwdDesc.gpuDriven                = true;
+            fwdDesc.occlusionEnabled         = useOcclusion;
+            fwdDesc.indirectPipeline         = mPBRIndirectPipeline;
+            fwdDesc.indirectPipelineLayout   = mPBRIndirectPipelineLayout;
+            fwdDesc.occluderBuffer           = mComputeCulling.GetOccluderIndirectBuffer();
+            fwdDesc.occluderCountBuffer      = mComputeCulling.GetOccluderCountBuffer();
+            fwdDesc.maxOccluderCount         = mIndirectRenderer.GetDrawCount();
+            fwdDesc.visibleBuffer            = mComputeCulling.GetVisibleIndirectBuffer();
+            fwdDesc.visibleCountBuffer       = mComputeCulling.GetVisibleCountBuffer();
+            fwdDesc.maxVisibleCount          = mIndirectRenderer.GetDrawCount();
+            fwdDesc.occlusionTestPassHandle  = occlusionTestPassH;
+            fwdDesc.frustumCullPassHandle    = frustumCullPassH;
+        }
+        forwardPassH = mRenderGraph.AddPass(std::make_unique<ForwardPass>(fwdDesc));
     }
-    if (useGPU) {
-        fwdDesc.gpuDriven                = true;
-        fwdDesc.occlusionEnabled         = useOcclusion;
-        fwdDesc.indirectPipeline         = mPBRIndirectPipeline;
-        fwdDesc.indirectPipelineLayout   = mPBRIndirectPipelineLayout;
-        fwdDesc.occluderBuffer           = mComputeCulling.GetOccluderIndirectBuffer();
-        fwdDesc.occluderCountBuffer      = mComputeCulling.GetOccluderCountBuffer();
-        fwdDesc.maxOccluderCount         = mIndirectRenderer.GetDrawCount();
-        fwdDesc.visibleBuffer            = mComputeCulling.GetVisibleIndirectBuffer();
-        fwdDesc.visibleCountBuffer       = mComputeCulling.GetVisibleCountBuffer();
-        fwdDesc.maxVisibleCount          = mIndirectRenderer.GetDrawCount();
-        fwdDesc.occlusionTestPassHandle  = occlusionTestPassH;
-        fwdDesc.frustumCullPassHandle    = frustumCullPassH;
-    }
-    auto forwardPassH = mRenderGraph.AddPass(std::make_unique<ForwardPass>(fwdDesc));
 
     // --- Ray tracing pass (between forward and post-process) ---
     RenderGraph::PassHandle rtPassH = RenderGraph::INVALID_PASS;
-    if (mRayTracingEnabled && (mRTShadowsEnabled || mRTReflEnabled)) {
-        float aspect_ = static_cast<float>(extent.width) / static_cast<float>(extent.height);
-        glm::mat4 viewMat_ = mCamera.GetViewMatrix();
-        glm::mat4 projMat_ = mCamera.GetProjectionMatrix(aspect_);
-        glm::mat4 viewProj_ = projMat_ * viewMat_;
-        glm::mat4 invVP_ = glm::inverse(viewProj_);
 
-        const auto* sunLight = mRegistry.GetLight(mSunEntity);
+    float rtAspect_ = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+    glm::mat4 rtViewMat_ = mCamera.GetViewMatrix();
+    glm::mat4 rtProjMat_ = mCamera.GetProjectionMatrix(rtAspect_);
+    glm::mat4 rtViewProj_ = rtProjMat_ * rtViewMat_;
+    glm::mat4 rtInvVP_ = glm::inverse(rtViewProj_);
+    float rtAz = glm::radians(mLightAzimuth);
+    float rtEl = glm::radians(mLightElevation);
+    glm::vec3 rtSunDir = glm::normalize(glm::vec3(
+        -glm::cos(rtEl) * glm::sin(rtAz), -glm::sin(rtEl), -glm::cos(rtEl) * glm::cos(rtAz)));
 
+    const auto* rtSunLight = mRegistry.GetLight(mSunEntity);
+    glm::vec3 rtSunColor = rtSunLight ? rtSunLight->color     : glm::vec3(1.0f);
+    float rtSunIntensity  = rtSunLight ? rtSunLight->intensity : 1.0f;
+
+    bool needsPT = (mActiveRenderMode == DebugUIState::RenderMode::FullPathTracing)
+                   || (splitEnabled && (uiSplit.splitModeA == DebugUIState::RenderMode::FullPathTracing
+                                     || uiSplit.splitModeB == DebugUIState::RenderMode::FullPathTracing));
+
+    if (needsPT && mRTPipelineSupported) {
+        UpdatePTCompositeDescriptors();
+
+        uint32_t splitLeft = 0, splitRight = 0;
+        if (splitEnabled) {
+            uint32_t splitX = static_cast<uint32_t>(uiSplit.splitScreenPos * extent.width);
+            splitX = std::min(splitX, extent.width);
+            bool ptOnLeft  = (uiSplit.splitModeA == DebugUIState::RenderMode::FullPathTracing);
+            bool ptOnRight = (uiSplit.splitModeB == DebugUIState::RenderMode::FullPathTracing);
+            if (ptOnLeft && ptOnRight) {
+                splitLeft = 0; splitRight = extent.width;
+            } else if (ptOnLeft) {
+                splitLeft = 0; splitRight = splitX;
+            } else {
+                splitLeft = splitX; splitRight = extent.width;
+            }
+        }
+
+        glm::mat4 viewMatPrev = mPTFirstNRDFrame ? rtViewMat_ : mPTViewMatPrev;
+        glm::mat4 projMatPrev = mPTFirstNRDFrame ? rtProjMat_ : mPTProjMatPrev;
+        if (mPTFirstNRDFrame) mPTFirstNRDFrame = false;
+        mPTViewMatPrev = rtViewMat_;
+        mPTProjMatPrev = rtProjMat_;
+
+        PathTracingPass::Desc ptDesc{};
+        ptDesc.colorResource      = hdrRes;
+        ptDesc.forwardPassHandle  = forwardPassH;
+        ptDesc.pathTracer         = &mPathTracer;
+        ptDesc.denoiser           = &mNRDDenoiser;
+        ptDesc.extent             = extent;
+        ptDesc.invViewProj        = rtInvVP_;
+        ptDesc.viewProj           = rtViewProj_;
+        ptDesc.viewMat            = rtViewMat_;
+        ptDesc.projMat            = rtProjMat_;
+        ptDesc.viewMatPrev        = viewMatPrev;
+        ptDesc.projMatPrev        = projMatPrev;
+        ptDesc.cameraPos          = mCamera.GetPosition();
+        ptDesc.sunDir             = -rtSunDir;
+        ptDesc.sunColor           = rtSunColor;
+        ptDesc.sunIntensity       = rtSunIntensity;
+        ptDesc.lightRadius        = mRTLightRadius;
+        ptDesc.enableDenoiser     = mDebugUI.GetState().ptEnableDenoiser;
+        bool useDenoiseComposite = ptDesc.enableDenoiser && mNRDDenoiser.GetOutputView() != VK_NULL_HANDLE
+                                   && !mDebugUI.GetState().ptBypassNRDOutput;
+        bool useCompareComposite = useDenoiseComposite && mDebugUI.GetState().ptDenoiserComparison
+                                   && mPTCompositeComparePipeline != VK_NULL_HANDLE;
+        ptDesc.compositePipeline   = useCompareComposite ? mPTCompositeComparePipeline   : (useDenoiseComposite ? mPTCompositeDenoisePipeline   : mPTCompositePipeline);
+        ptDesc.compositePipeLayout = useCompareComposite ? mPTCompositeComparePipeLayout : (useDenoiseComposite ? mPTCompositeDenoisePipeLayout : mPTCompositePipeLayout);
+        ptDesc.compositeDescSet    = useCompareComposite ? mPTCompositeCompareDescSet    : (useDenoiseComposite ? mPTCompositeDenoiseDescSet    : mPTCompositeDescSet);
+        ptDesc.splitLeft          = splitLeft;
+        ptDesc.splitRight         = splitRight;
+        ptDesc.compareSplitX      = useCompareComposite ? (splitRight > 0 ? (splitLeft + splitRight) / 2 : extent.width / 2) : 0;
+        rtPassH = mRenderGraph.AddPass(std::make_unique<PathTracingPass>(ptDesc));
+
+    } else if (mActiveRenderMode == DebugUIState::RenderMode::Hybrid && mRTPipelineSupported) {
+        // Hybrid mode — raster G-buffer + RT GI lighting
+        // Phase 9 RT shadows/reflections also run in hybrid mode
+        if (mRayTracingEnabled && (mRTShadowsEnabled || mRTReflEnabled)) {
+            mRTShadows.SetEnabled(mRTShadowsEnabled);
+            mRTReflections.SetEnabled(mRTReflEnabled);
+
+            if (mRTCompositeDescDirty) {
+                VkDescriptorImageInfo hdrInfo{VK_NULL_HANDLE, mPostProcess.GetHDRView(), VK_IMAGE_LAYOUT_GENERAL};
+                VkDescriptorImageInfo shadowInfo{mRTDepthSampler, mRTShadows.GetOutputView(), VK_IMAGE_LAYOUT_GENERAL};
+                VkDescriptorImageInfo reflInfo{mRTDepthSampler, mRTReflections.GetOutputView(), VK_IMAGE_LAYOUT_GENERAL};
+
+                VkWriteDescriptorSet writes[3] = {};
+                writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, mRTCompositeDescSet,
+                              0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hdrInfo};
+                writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, mRTCompositeDescSet,
+                              1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &shadowInfo};
+                writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, mRTCompositeDescSet,
+                              2, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &reflInfo};
+                vkUpdateDescriptorSets(mDevice.GetHandle(), 3, writes, 0, nullptr);
+                mRTCompositeDescDirty = false;
+            }
+
+            RayTracingPass::Desc rtDesc{};
+            rtDesc.depthResource     = depthRes;
+            rtDesc.colorResource     = hdrRes;
+            rtDesc.forwardPassHandle = forwardPassH;
+            rtDesc.shadows           = &mRTShadows;
+            rtDesc.reflections       = &mRTReflections;
+            rtDesc.accel             = &mAccelStructure;
+            rtDesc.depthView         = mDepthImage.GetView();
+            rtDesc.depthSampler      = mRTDepthSampler;
+            rtDesc.extent            = extent;
+            rtDesc.invViewProj       = rtInvVP_;
+            rtDesc.lightDir          = -rtSunDir;
+            rtDesc.lightRadius       = mRTLightRadius;
+            rtDesc.cameraPos         = mCamera.GetPosition();
+            rtDesc.roughness         = mRTReflRoughness;
+            rtDesc.compositePipeline   = mRTCompositePipeline;
+            rtDesc.compositePipeLayout = mRTCompositePipeLayout;
+            rtDesc.compositeDescSet    = mRTCompositeDescSet;
+            rtDesc.shadowStrength      = mRTShadowStrength;
+            rtDesc.reflectionStrength  = mRTReflStrength;
+            rtDesc.debugShadowVis      = mRTDebugShadowVis;
+            rtPassH = mRenderGraph.AddPass(std::make_unique<RayTracingPass>(rtDesc));
+        }
+
+        // Hybrid RT GI pass (runs after forward + RT shadows/reflections)
+        UpdatePTCompositeDescriptors();
+
+        glm::mat4 hybridViewPrev = mPTFirstNRDFrame ? rtViewMat_ : mPTViewMatPrev;
+        glm::mat4 hybridProjPrev = mPTFirstNRDFrame ? rtProjMat_ : mPTProjMatPrev;
+        if (mPTFirstNRDFrame) mPTFirstNRDFrame = false;
+        mPTViewMatPrev = rtViewMat_;
+        mPTProjMatPrev = rtProjMat_;
+
+        HybridRTPass::Desc hybridDesc{};
+        hybridDesc.depthResource     = depthRes;
+        hybridDesc.colorResource     = hdrRes;
+        hybridDesc.forwardPassHandle = (rtPassH != RenderGraph::INVALID_PASS) ? rtPassH : forwardPassH;
+        hybridDesc.pathTracer        = &mPathTracer;
+        hybridDesc.denoiser          = &mNRDDenoiser;
+        hybridDesc.extent            = extent;
+        hybridDesc.invViewProj       = rtInvVP_;
+        hybridDesc.viewProj          = rtViewProj_;
+        hybridDesc.viewMat           = rtViewMat_;
+        hybridDesc.projMat           = rtProjMat_;
+        hybridDesc.viewMatPrev       = hybridViewPrev;
+        hybridDesc.projMatPrev       = hybridProjPrev;
+        hybridDesc.cameraPos         = mCamera.GetPosition();
+        hybridDesc.sunDir            = -rtSunDir;
+        hybridDesc.sunColor          = rtSunColor;
+        hybridDesc.sunIntensity      = rtSunIntensity;
+        hybridDesc.lightRadius       = mRTLightRadius;
+        hybridDesc.enableDenoiser    = mDebugUI.GetState().ptEnableDenoiser;
+        bool useDenoiseComposite = hybridDesc.enableDenoiser && mNRDDenoiser.GetOutputView() != VK_NULL_HANDLE
+                                   && !mDebugUI.GetState().ptBypassNRDOutput;
+        bool useCompareComposite = useDenoiseComposite && mDebugUI.GetState().ptDenoiserComparison
+                                   && mPTCompositeComparePipeline != VK_NULL_HANDLE;
+        hybridDesc.compositePipeline   = useCompareComposite ? mPTCompositeComparePipeline   : (useDenoiseComposite ? mPTCompositeDenoisePipeline   : mPTCompositePipeline);
+        hybridDesc.compositePipeLayout = useCompareComposite ? mPTCompositeComparePipeLayout : (useDenoiseComposite ? mPTCompositeDenoisePipeLayout : mPTCompositePipeLayout);
+        hybridDesc.compositeDescSet    = useCompareComposite ? mPTCompositeCompareDescSet    : (useDenoiseComposite ? mPTCompositeDenoiseDescSet    : mPTCompositeDescSet);
+        hybridDesc.compareSplitX       = useCompareComposite ? extent.width / 2 : 0;
+        rtPassH = mRenderGraph.AddPass(std::make_unique<HybridRTPass>(hybridDesc));
+
+    } else if (mRayTracingEnabled && (mRTShadowsEnabled || mRTReflEnabled)) {
+        // Rasterization mode with Phase 9 RT effects
         mRTShadows.SetEnabled(mRTShadowsEnabled);
         mRTReflections.SetEnabled(mRTReflEnabled);
 
-        // Update composite descriptor set (only when resources change)
         if (mRTCompositeDescDirty) {
             VkDescriptorImageInfo hdrInfo{VK_NULL_HANDLE, mPostProcess.GetHDRView(), VK_IMAGE_LAYOUT_GENERAL};
             VkDescriptorImageInfo shadowInfo{mRTDepthSampler, mRTShadows.GetOutputView(), VK_IMAGE_LAYOUT_GENERAL};
@@ -1343,11 +1525,7 @@ void Application::BuildAndExecuteRenderGraph(VkCommandBuffer cmd, uint32_t image
         rtDesc.depthView         = mDepthImage.GetView();
         rtDesc.depthSampler      = mRTDepthSampler;
         rtDesc.extent            = extent;
-        rtDesc.invViewProj       = invVP_;
-        float rtAz = glm::radians(mLightAzimuth);
-        float rtEl = glm::radians(mLightElevation);
-        glm::vec3 rtSunDir = glm::normalize(glm::vec3(
-            -glm::cos(rtEl) * glm::sin(rtAz), -glm::sin(rtEl), -glm::cos(rtEl) * glm::cos(rtAz)));
+        rtDesc.invViewProj       = rtInvVP_;
         rtDesc.lightDir          = -rtSunDir;
         rtDesc.lightRadius       = mRTLightRadius;
         rtDesc.cameraPos         = mCamera.GetPosition();
@@ -1358,7 +1536,6 @@ void Application::BuildAndExecuteRenderGraph(VkCommandBuffer cmd, uint32_t image
         rtDesc.shadowStrength      = mRTShadowStrength;
         rtDesc.reflectionStrength  = mRTReflStrength;
         rtDesc.debugShadowVis      = mRTDebugShadowVis;
-
         rtPassH = mRenderGraph.AddPass(std::make_unique<RayTracingPass>(rtDesc));
     }
 
@@ -1504,13 +1681,18 @@ void Application::InitDebugUI() {
     uiState.lightAzimuth     = mLightAzimuth;
     uiState.lightElevation   = mLightElevation;
     uiState.csmEnabled       = mCSMEnabled;
-    uiState.rtAvailable      = mRayTracingEnabled;
-    uiState.rtShadowsEnabled = mRTShadowsEnabled;
-    uiState.rtReflEnabled     = mRTReflEnabled;
-    uiState.rtShadowStrength  = mRTShadowStrength;
-    uiState.rtReflStrength    = mRTReflStrength;
-    uiState.rtReflRoughness   = mRTReflRoughness;
-    uiState.rtLightRadius     = mRTLightRadius;
+    uiState.rtAvailable         = mRayTracingEnabled;
+    uiState.rtPipelineAvailable = mRTPipelineSupported;
+    uiState.rtShadowsEnabled   = mRTShadowsEnabled;
+    uiState.rtReflEnabled       = mRTReflEnabled;
+    uiState.rtShadowStrength    = mRTShadowStrength;
+    uiState.rtReflStrength      = mRTReflStrength;
+    uiState.rtReflRoughness     = mRTReflRoughness;
+    uiState.rtLightRadius       = mRTLightRadius;
+    uiState.renderMode          = mActiveRenderMode;
+    uiState.ptMaxBounces        = mPathTracer.maxBounces;
+    uiState.ptEnableMIS         = mPathTracer.enableMIS;
+    uiState.ptProgressive       = mPathTracer.progressive;
 
     mGPUProfiler.Initialize(device, mDevice.GetPhysicalDevice(), FRAMES_IN_FLIGHT, 32);
     mPipelineStats.Initialize(device, FRAMES_IN_FLIGHT);
@@ -1550,14 +1732,31 @@ void Application::SyncUIState() {
     mCSMEnabled     = uiState.csmEnabled;
 
     // RT state sync
-    uiState.rtAvailable     = mRayTracingEnabled;
-    mRTShadowsEnabled       = uiState.rtShadowsEnabled;
-    mRTReflEnabled           = uiState.rtReflEnabled;
-    mRTShadowStrength        = uiState.rtShadowStrength;
-    mRTReflStrength          = uiState.rtReflStrength;
-    mRTReflRoughness         = uiState.rtReflRoughness;
-    mRTLightRadius           = uiState.rtLightRadius;
-    mRTDebugShadowVis        = uiState.rtDebugShadowVis;
+    uiState.rtAvailable         = mRayTracingEnabled;
+    uiState.rtPipelineAvailable = mRTPipelineSupported;
+    mRTShadowsEnabled          = uiState.rtShadowsEnabled;
+    mRTReflEnabled              = uiState.rtReflEnabled;
+    mRTShadowStrength           = uiState.rtShadowStrength;
+    mRTReflStrength             = uiState.rtReflStrength;
+    mRTReflRoughness            = uiState.rtReflRoughness;
+    mRTLightRadius              = uiState.rtLightRadius;
+    mRTDebugShadowVis           = uiState.rtDebugShadowVis;
+
+    // Phase 10: render mode sync
+    if (uiState.renderModeChanged) {
+        uiState.renderModeChanged = false;
+        auto requestedMode = uiState.renderMode;
+        if ((requestedMode != DebugUIState::RenderMode::Rasterization) && !mRTPipelineSupported)
+            requestedMode = DebugUIState::RenderMode::Rasterization;
+        RebuildRenderGraphForMode(requestedMode);
+    }
+
+    // Sync path tracer settings
+    if (mRTPipelineSupported) {
+        mPathTracer.maxBounces  = uiState.ptMaxBounces;
+        mPathTracer.enableMIS   = uiState.ptEnableMIS;
+        mPathTracer.progressive = uiState.ptProgressive;
+    }
 
     if (gpuChanged) {
         LOG_INFO("Render mode changed: GPU-driven={}, occlusion={}",
@@ -1710,6 +1909,8 @@ void Application::InitRayTracing() {
     LOG_INFO("Ray tracing initialized: BLAS {:.1f} KB, TLAS {:.1f} KB",
              mAccelStructure.GetTotalBLASMemory() / 1024.0f,
              mAccelStructure.GetTLASMemory() / 1024.0f);
+
+    InitRTPipeline();
 }
 
 void Application::ShutdownRayTracing() {
@@ -1731,6 +1932,313 @@ void Application::ShutdownRayTracing() {
     mRTCompositeDescPool   = VK_NULL_HANDLE;
     mRTCompositeDescLayout = VK_NULL_HANDLE;
     mRTDepthSampler        = VK_NULL_HANDLE;
+
+    ShutdownRTPipeline();
+}
+
+// =======================================================================
+// Phase 10: Full RT Pipeline
+// =======================================================================
+void Application::InitRTPipeline() {
+    if (!mDevice.IsRTPipelineSupported() || !mRayTracingEnabled) {
+        mRTPipelineSupported = false;
+        LOG_INFO("RT Pipeline: disabled ({})",
+                 mDevice.IsRTPipelineSupported() ? "no AS" : "not supported");
+        return;
+    }
+
+    mRTPipelineSupported = true;
+    auto device    = mDevice.GetHandle();
+    auto allocator = mMemory.GetAllocator();
+    auto extent    = mSwapchain.GetExtent();
+
+    mPathTracer.Initialize(device, allocator, mShaders, mTransfer,
+                           mDevice.GetRTPipelineProperties(),
+                           extent.width, extent.height);
+
+    mNRDDenoiser.Initialize(mVulkanInstance.GetHandle(), device, allocator, mShaders,
+                             mDevice.GetPhysicalDevice(),
+                             mDevice.GetGraphicsQueue(),
+                             mDevice.GetQueueFamilyIndices().graphicsFamily,
+                             extent.width, extent.height);
+
+    // Rebuild TLAS (SBT simplified — single hit group pair, offset = 0)
+    mAccelStructure.BuildTLAS(mRegistry, mMeshPool);
+
+    // Update path tracer scene data
+    mPathTracer.UpdateScene(device, allocator, mTransfer,
+        mAccelStructure.GetTLAS(), mMeshPool,
+        mAccelStructure.GetInstanceInfos(),
+        mMaterialSSBO.GetHandle(), mGPUMaterials.size() * sizeof(GPUMaterialData),
+        mDescriptors.GetSet(), mDescriptors.GetLayout(),
+        mIBL.GetEnvCubeView(), mIBL.GetCubeSampler(),
+        mIBL.GetIrradianceView(),
+        mIBL.GetBRDFLutView(), mIBL.GetLutSampler());
+
+    // PT composite pipeline (copies PT output to HDR image)
+    {
+        VkSamplerCreateInfo samplerCI{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        samplerCI.magFilter    = VK_FILTER_LINEAR;
+        samplerCI.minFilter    = VK_FILTER_LINEAR;
+        samplerCI.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerCI.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        VK_CHECK(vkCreateSampler(device, &samplerCI, nullptr, &mPTSampler));
+
+        VkDescriptorSetLayoutBinding bindings[2] = {};
+        bindings[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+        bindings[1] = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+
+        VkDescriptorBindingFlags bindFlags[2] = {
+            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
+            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
+        };
+        VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+        flagsInfo.bindingCount  = 2;
+        flagsInfo.pBindingFlags = bindFlags;
+
+        VkDescriptorSetLayoutCreateInfo layoutCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        layoutCI.pNext        = &flagsInfo;
+        layoutCI.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+        layoutCI.bindingCount = 2;
+        layoutCI.pBindings    = bindings;
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &layoutCI, nullptr, &mPTCompositeDescLayout));
+
+        VkDescriptorPoolSize poolSizes[] = {
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+        };
+        VkDescriptorPoolCreateInfo poolCI{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolCI.flags         = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+        poolCI.maxSets       = 1;
+        poolCI.poolSizeCount = 2;
+        poolCI.pPoolSizes    = poolSizes;
+        VK_CHECK(vkCreateDescriptorPool(device, &poolCI, nullptr, &mPTCompositeDescPool));
+
+        VkDescriptorSetAllocateInfo allocCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocCI.descriptorPool     = mPTCompositeDescPool;
+        allocCI.descriptorSetCount = 1;
+        allocCI.pSetLayouts        = &mPTCompositeDescLayout;
+        VK_CHECK(vkAllocateDescriptorSets(device, &allocCI, &mPTCompositeDescSet));
+
+        VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16}; // uvec2 resolution + uint splitLeft + uint splitRight
+        VkPipelineLayoutCreateInfo pipeLayoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pipeLayoutCI.setLayoutCount         = 1;
+        pipeLayoutCI.pSetLayouts            = &mPTCompositeDescLayout;
+        pipeLayoutCI.pushConstantRangeCount = 1;
+        pipeLayoutCI.pPushConstantRanges    = &pcRange;
+        VK_CHECK(vkCreatePipelineLayout(device, &pipeLayoutCI, nullptr, &mPTCompositePipeLayout));
+
+        VkShaderModule mod = mShaders.GetOrLoad("shaders/pt_composite.comp.spv");
+        VkComputePipelineCreateInfo pipeCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeCI.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipeCI.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeCI.stage.module = mod;
+        pipeCI.stage.pName  = "main";
+        pipeCI.layout       = mPTCompositePipeLayout;
+        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeCI, nullptr, &mPTCompositePipeline));
+
+        // Denoise composite: hdrOutput, NRD output, albedo (for remodulation)
+        VkDescriptorSetLayoutBinding denoiseBindings[3] = {};
+        denoiseBindings[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+        denoiseBindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+        denoiseBindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+        VkDescriptorBindingFlags denoiseBindFlags[3] = {
+            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
+            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
+            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
+        };
+        VkDescriptorSetLayoutBindingFlagsCreateInfo denoiseFlagsInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+        denoiseFlagsInfo.bindingCount  = 3;
+        denoiseFlagsInfo.pBindingFlags = denoiseBindFlags;
+        VkDescriptorSetLayoutCreateInfo denoiseLayoutCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        denoiseLayoutCI.pNext        = &denoiseFlagsInfo;
+        denoiseLayoutCI.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+        denoiseLayoutCI.bindingCount = 3;
+        denoiseLayoutCI.pBindings    = denoiseBindings;
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &denoiseLayoutCI, nullptr, &mPTCompositeDenoiseDescLayout));
+
+        VkDescriptorPoolSize denoisePoolSizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3}};
+        VkDescriptorPoolCreateInfo denoisePoolCI{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        denoisePoolCI.flags         = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+        denoisePoolCI.maxSets       = 1;
+        denoisePoolCI.poolSizeCount = 1;
+        denoisePoolCI.pPoolSizes    = denoisePoolSizes;
+        VK_CHECK(vkCreateDescriptorPool(device, &denoisePoolCI, nullptr, &mPTCompositeDenoiseDescPool));
+
+        VkDescriptorSetAllocateInfo denoiseAllocCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        denoiseAllocCI.descriptorPool     = mPTCompositeDenoiseDescPool;
+        denoiseAllocCI.descriptorSetCount = 1;
+        denoiseAllocCI.pSetLayouts        = &mPTCompositeDenoiseDescLayout;
+        VK_CHECK(vkAllocateDescriptorSets(device, &denoiseAllocCI, &mPTCompositeDenoiseDescSet));
+
+        VkPipelineLayoutCreateInfo denoisePipeLayoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        denoisePipeLayoutCI.setLayoutCount         = 1;
+        denoisePipeLayoutCI.pSetLayouts            = &mPTCompositeDenoiseDescLayout;
+        denoisePipeLayoutCI.pushConstantRangeCount = 1;
+        denoisePipeLayoutCI.pPushConstantRanges    = &pcRange;
+        VK_CHECK(vkCreatePipelineLayout(device, &denoisePipeLayoutCI, nullptr, &mPTCompositeDenoisePipeLayout));
+
+        VkShaderModule denoiseMod = mShaders.GetOrLoad("shaders/pt_composite_denoise.comp.spv");
+        VkComputePipelineCreateInfo denoisePipeCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        denoisePipeCI.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        denoisePipeCI.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+        denoisePipeCI.stage.module = denoiseMod;
+        denoisePipeCI.stage.pName  = "main";
+        denoisePipeCI.layout       = mPTCompositeDenoisePipeLayout;
+        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &denoisePipeCI, nullptr, &mPTCompositeDenoisePipeline));
+
+        // Compare composite: 4 bindings (hdrOutput, denoisedInput, accumInput, albedoInput), 20-byte push constants
+        VkDescriptorSetLayoutBinding compareBindings[4] = {};
+        compareBindings[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+        compareBindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+        compareBindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+        compareBindings[3] = {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+        VkDescriptorBindingFlags compareBindFlags[4] = {
+            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
+            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
+            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
+            VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
+        };
+        VkDescriptorSetLayoutBindingFlagsCreateInfo compareFlagsInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+        compareFlagsInfo.bindingCount  = 4;
+        compareFlagsInfo.pBindingFlags = compareBindFlags;
+        VkDescriptorSetLayoutCreateInfo compareLayoutCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        compareLayoutCI.pNext        = &compareFlagsInfo;
+        compareLayoutCI.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+        compareLayoutCI.bindingCount = 4;
+        compareLayoutCI.pBindings    = compareBindings;
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &compareLayoutCI, nullptr, &mPTCompositeCompareDescLayout));
+
+        VkDescriptorPoolSize comparePoolSizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4}};
+        VkDescriptorPoolCreateInfo comparePoolCI{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        comparePoolCI.flags         = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+        comparePoolCI.maxSets       = 1;
+        comparePoolCI.poolSizeCount = 1;
+        comparePoolCI.pPoolSizes    = comparePoolSizes;
+        VK_CHECK(vkCreateDescriptorPool(device, &comparePoolCI, nullptr, &mPTCompositeCompareDescPool));
+
+        VkDescriptorSetAllocateInfo compareAllocCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        compareAllocCI.descriptorPool     = mPTCompositeCompareDescPool;
+        compareAllocCI.descriptorSetCount = 1;
+        compareAllocCI.pSetLayouts        = &mPTCompositeCompareDescLayout;
+        VK_CHECK(vkAllocateDescriptorSets(device, &compareAllocCI, &mPTCompositeCompareDescSet));
+
+        VkPushConstantRange comparePCRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, 20};  // uvec2 + 3*uint
+        VkPipelineLayoutCreateInfo comparePipeLayoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        comparePipeLayoutCI.setLayoutCount         = 1;
+        comparePipeLayoutCI.pSetLayouts            = &mPTCompositeCompareDescLayout;
+        comparePipeLayoutCI.pushConstantRangeCount = 1;
+        comparePipeLayoutCI.pPushConstantRanges    = &comparePCRange;
+        VK_CHECK(vkCreatePipelineLayout(device, &comparePipeLayoutCI, nullptr, &mPTCompositeComparePipeLayout));
+
+        VkShaderModule compareMod = mShaders.GetOrLoad("shaders/pt_composite_compare.comp.spv");
+        if (compareMod != VK_NULL_HANDLE) {
+            VkComputePipelineCreateInfo comparePipeCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            comparePipeCI.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            comparePipeCI.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+            comparePipeCI.stage.module = compareMod;
+            comparePipeCI.stage.pName  = "main";
+            comparePipeCI.layout       = mPTCompositeComparePipeLayout;
+            VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &comparePipeCI, nullptr, &mPTCompositeComparePipeline));
+        }
+    }
+
+    mPTCompositeDescDirty = true;
+
+    LOG_INFO("RT Pipeline (Phase 10) initialized: path tracer + NRD denoiser");
+}
+
+void Application::ShutdownRTPipeline() {
+    auto device    = mDevice.GetHandle();
+    auto allocator = mMemory.GetAllocator();
+
+    mPathTracer.Shutdown(device, allocator);
+    mNRDDenoiser.Shutdown(device, allocator);
+
+    if (mPTCompositePipeline)   { vkDestroyPipeline(device, mPTCompositePipeline, nullptr);       mPTCompositePipeline   = VK_NULL_HANDLE; }
+    if (mPTCompositePipeLayout) { vkDestroyPipelineLayout(device, mPTCompositePipeLayout, nullptr); mPTCompositePipeLayout = VK_NULL_HANDLE; }
+    if (mPTCompositeDescPool)   { vkDestroyDescriptorPool(device, mPTCompositeDescPool, nullptr);   mPTCompositeDescPool   = VK_NULL_HANDLE; }
+    if (mPTCompositeDescLayout) { vkDestroyDescriptorSetLayout(device, mPTCompositeDescLayout, nullptr); mPTCompositeDescLayout = VK_NULL_HANDLE; }
+    if (mPTCompositeDenoisePipeline)   { vkDestroyPipeline(device, mPTCompositeDenoisePipeline, nullptr);       mPTCompositeDenoisePipeline   = VK_NULL_HANDLE; }
+    if (mPTCompositeDenoisePipeLayout) { vkDestroyPipelineLayout(device, mPTCompositeDenoisePipeLayout, nullptr); mPTCompositeDenoisePipeLayout = VK_NULL_HANDLE; }
+    if (mPTCompositeDenoiseDescPool)   { vkDestroyDescriptorPool(device, mPTCompositeDenoiseDescPool, nullptr);   mPTCompositeDenoiseDescPool   = VK_NULL_HANDLE; }
+    if (mPTCompositeDenoiseDescLayout) { vkDestroyDescriptorSetLayout(device, mPTCompositeDenoiseDescLayout, nullptr); mPTCompositeDenoiseDescLayout = VK_NULL_HANDLE; }
+    if (mPTCompositeComparePipeline)   { vkDestroyPipeline(device, mPTCompositeComparePipeline, nullptr);       mPTCompositeComparePipeline   = VK_NULL_HANDLE; }
+    if (mPTCompositeComparePipeLayout) { vkDestroyPipelineLayout(device, mPTCompositeComparePipeLayout, nullptr); mPTCompositeComparePipeLayout = VK_NULL_HANDLE; }
+    if (mPTCompositeCompareDescPool)   { vkDestroyDescriptorPool(device, mPTCompositeCompareDescPool, nullptr);   mPTCompositeCompareDescPool   = VK_NULL_HANDLE; }
+    if (mPTCompositeCompareDescLayout) { vkDestroyDescriptorSetLayout(device, mPTCompositeCompareDescLayout, nullptr); mPTCompositeCompareDescLayout = VK_NULL_HANDLE; }
+    if (mPTSampler)             { vkDestroySampler(device, mPTSampler, nullptr);                   mPTSampler             = VK_NULL_HANDLE; }
+
+    mRTPipelineSupported = false;
+}
+
+void Application::UpdatePTCompositeDescriptors() {
+    if (!mRTPipelineSupported) return;
+
+    auto device = mDevice.GetHandle();
+    bool denoiserOn = mDebugUI.GetState().ptEnableDenoiser && mNRDDenoiser.GetOutputView() != VK_NULL_HANDLE;
+    bool useDenoiseComposite = denoiserOn && !mDebugUI.GetState().ptBypassNRDOutput;
+
+    VkImageView hdrView = mPostProcess.GetHDRView();
+    VkImageView ptOutputView = mPathTracer.GetAccumOutputView();
+    if (useDenoiseComposite)
+        ptOutputView = mNRDDenoiser.GetOutputView();
+
+    if (hdrView == VK_NULL_HANDLE || ptOutputView == VK_NULL_HANDLE) return;
+
+    VkDescriptorImageInfo hdrInfo{VK_NULL_HANDLE, hdrView, VK_IMAGE_LAYOUT_GENERAL};
+
+    // Regular composite (accum buffer, COMBINED_IMAGE_SAMPLER) - used when denoiser off or bypassing NRD
+    VkDescriptorImageInfo ptInfo{mPTSampler, mPathTracer.GetAccumOutputView(), VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet writes[2] = {};
+    writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, mPTCompositeDescSet,
+                  0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hdrInfo};
+    writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, mPTCompositeDescSet,
+                  1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &ptInfo};
+    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+
+    // Denoise composite (RGBA16F via STORAGE_IMAGE + imageLoad, albedo for remodulation)
+    if (denoiserOn) {
+        VkDescriptorImageInfo denoiseHdrInfo{VK_NULL_HANDLE, hdrView, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo denoisePtInfo{VK_NULL_HANDLE, mNRDDenoiser.GetOutputView(), VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo denoiseAlbedoInfo{VK_NULL_HANDLE, mPathTracer.GetAlbedoOutputView(), VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet denoiseWrites[3] = {};
+        denoiseWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, mPTCompositeDenoiseDescSet,
+                            0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &denoiseHdrInfo};
+        denoiseWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, mPTCompositeDenoiseDescSet,
+                            1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &denoisePtInfo};
+        denoiseWrites[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, mPTCompositeDenoiseDescSet,
+                            2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &denoiseAlbedoInfo};
+        vkUpdateDescriptorSets(device, 3, denoiseWrites, 0, nullptr);
+
+        // Compare composite (split-screen L=denoised, R=raw)
+        if (mDebugUI.GetState().ptDenoiserComparison) {
+            VkDescriptorImageInfo compareHdrInfo{VK_NULL_HANDLE, hdrView, VK_IMAGE_LAYOUT_GENERAL};
+            VkDescriptorImageInfo compareDenoisedInfo{VK_NULL_HANDLE, mNRDDenoiser.GetOutputView(), VK_IMAGE_LAYOUT_GENERAL};
+            VkDescriptorImageInfo compareAccumInfo{VK_NULL_HANDLE, mPathTracer.GetAccumOutputView(), VK_IMAGE_LAYOUT_GENERAL};
+            VkDescriptorImageInfo compareAlbedoInfo{VK_NULL_HANDLE, mPathTracer.GetAlbedoOutputView(), VK_IMAGE_LAYOUT_GENERAL};
+            VkWriteDescriptorSet compareWrites[4] = {};
+            compareWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, mPTCompositeCompareDescSet,
+                                0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &compareHdrInfo};
+            compareWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, mPTCompositeCompareDescSet,
+                                1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &compareDenoisedInfo};
+            compareWrites[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, mPTCompositeCompareDescSet,
+                                2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &compareAccumInfo};
+            compareWrites[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, mPTCompositeCompareDescSet,
+                                3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &compareAlbedoInfo};
+            vkUpdateDescriptorSets(device, 4, compareWrites, 0, nullptr);
+        }
+    }
+}
+
+void Application::RebuildRenderGraphForMode(DebugUIState::RenderMode mode) {
+    mDevice.WaitIdle();
+    mActiveRenderMode = mode;
+    mPathTracer.ResetAccumulation();
+    mNRDDenoiser.InvalidateHistory();
+    mPTFirstNRDFrame = true;
+    mPTCompositeDescDirty = true;
+    LOG_INFO("Render mode changed to: {}", static_cast<int>(mode));
 }
 
 // =======================================================================
@@ -1846,8 +2354,8 @@ void Application::LoadTestScene() {
     pushMat({0.1f, 0.2f, 0.85f}, 0.0f, 0.5f, mWhiteTexDescIdx);
     // 4: wood sphere (dielectric, medium-high roughness)
     pushMat({0.55f, 0.35f, 0.18f}, 0.0f, 0.65f, mWhiteTexDescIdx);
-    // 7: smooth green plastic sphere
-    pushMat({0.1f, 0.75f, 0.15f}, 0.0f, 0.15f, mWhiteTexDescIdx);
+    // 5: light gray reflective plane (smooth dielectric)
+    pushMat({0.85f, 0.85f, 0.85f}, 0.0f, 0.15f, mWhiteTexDescIdx);
     // 5: mirror floor (metallic, very smooth)
     pushMat({0.6f, 0.1f, 0.6f}, 1.0f, 0.02f, mWhiteTexDescIdx);
     // 6: white wall / tall pillar (dielectric)
@@ -1888,9 +2396,11 @@ void Application::LoadTestScene() {
     if (mDevice.IsRayTracingSupported()) {
         mMeshPool.Upload(allocator, mTransfer, mModelData.meshes,
             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     } else {
         mMeshPool.Upload(allocator, mTransfer, mModelData.meshes);
     }
@@ -1999,6 +2509,13 @@ void Application::RecreateSwapchain() {
         mRTShadows.Resize(mDevice.GetHandle(), mMemory.GetAllocator(), extent.width, extent.height);
         mRTReflections.Resize(mDevice.GetHandle(), mMemory.GetAllocator(), extent.width, extent.height);
         mRTCompositeDescDirty = true;
+    }
+
+    if (mRTPipelineSupported) {
+        auto extent = mSwapchain.GetExtent();
+        mPathTracer.Resize(mDevice.GetHandle(), mMemory.GetAllocator(), extent.width, extent.height);
+        mNRDDenoiser.Resize(mDevice.GetHandle(), mMemory.GetAllocator(), extent.width, extent.height);
+        mPTCompositeDescDirty = true;
     }
 
     LOG_INFO("Swapchain recreated (MSAA: {}x)", static_cast<int>(mCurrentMSAA));

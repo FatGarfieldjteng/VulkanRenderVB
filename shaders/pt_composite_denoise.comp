@@ -1,0 +1,44 @@
+#version 460
+
+// Composite for NRD denoiser output (RGBA16F, matches NRD internal format).
+// NRD REBLUR outputs YCoCg in .xyz; unpack to linear RGB (NRD.hlsli _NRD_YCoCgToLinear).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D hdrOutput;
+layout(set = 0, binding = 1, rgba16f) uniform image2D ptInput;
+layout(set = 0, binding = 2, rgba8)   uniform readonly image2D albedoInput;
+
+layout(push_constant) uniform PushConstants {
+    uvec2 resolution;
+    uint  splitLeft;
+    uint  splitRight;
+};
+
+vec3 yCoCgToLinear(vec3 ycocg) {
+    float t = ycocg.x - ycocg.z;
+    return max(vec3(t + ycocg.y, ycocg.x + ycocg.z, t - ycocg.y), vec3(0.0));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(resolution)))) return;
+
+    if (uint(pixel.x) < splitLeft || uint(pixel.x) >= splitRight) return;
+
+    vec4 raw = imageLoad(ptInput, pixel);
+    vec3 irradiance = yCoCgToLinear(raw.rgb);
+
+    if (any(isnan(irradiance)) || any(isinf(irradiance))) irradiance = vec3(0.0);
+    irradiance = max(irradiance, vec3(0.0));
+
+    // Remodulation: denoised irradiance * effective_albedo. Must match prepack: radiance / max(albedo, 0.12)
+    vec3 albedo = imageLoad(albedoInput, pixel).rgb;
+    albedo = pow(albedo, vec3(2.2));  // sRGB to linear
+    vec3 effectiveAlbedo = max(albedo, vec3(0.12));
+    vec3 ptColor = irradiance * effectiveAlbedo;
+
+    // Clamp to prevent over-bright from disocclusion/zoom artifacts (matches raygen firefly cap)
+    ptColor = clamp(ptColor, vec3(0.0), vec3(100.0));
+
+    imageStore(hdrOutput, pixel, vec4(ptColor, 1.0));
+}

@@ -119,6 +119,7 @@ void DebugUI::BuildUI(float deltaTime, const GPUProfiler* profiler, const Pipeli
 
     DrawMainMenuBar();
     DrawRenderSettingsPanel(deltaTime, supportedMSAA);
+    DrawRenderModePanel();
     DrawSceneHierarchyPanel(registry);
     DrawMaterialEditorPanel(materials);
     DrawProfilerPanel(profiler);
@@ -443,6 +444,77 @@ void DebugUI::DrawToneMappingPanel(PostProcessSettings* settings) {
     if (ImGui::Button("Reset AgX Defaults")) {
         settings->agxSaturation = 1.0f;
         settings->agxPunch      = 0.0f;
+    }
+
+    ImGui::End();
+}
+
+void DebugUI::DrawRenderModePanel() {
+    ImGui::Begin("Render Mode");
+
+    const char* modeNames[] = { "Rasterization", "Hybrid (Raster + RT GI)", "Full Path Tracing" };
+    bool rtHW = mState.rtAvailable && mState.rtPipelineAvailable;
+
+    ImGui::Text("Active Pipeline");
+    for (int i = 0; i < 3; i++) {
+        bool disabled = (i > 0 && !rtHW);
+        if (disabled) {
+            ImGui::BeginDisabled();
+        }
+        bool selected = (static_cast<int>(mState.renderMode) == i);
+        if (ImGui::RadioButton(modeNames[i], selected)) {
+            auto newMode = static_cast<DebugUIState::RenderMode>(i);
+            if (newMode != mState.renderMode) {
+                mState.renderMode = newMode;
+                mState.renderModeChanged = true;
+            }
+        }
+        if (disabled) {
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Ray tracing hardware not available");
+        }
+    }
+
+    if (mState.renderMode == DebugUIState::RenderMode::FullPathTracing ||
+        mState.renderMode == DebugUIState::RenderMode::Hybrid) {
+        ImGui::Separator();
+        ImGui::Text("Path Tracer Settings");
+        ImGui::SliderInt("Max Bounces", &mState.ptMaxBounces, 1, 32);
+        ImGui::Checkbox("MIS (Multiple Importance Sampling)", &mState.ptEnableMIS);
+        ImGui::Checkbox("Denoiser (NRD REBLUR)", &mState.ptEnableDenoiser);
+        if (mState.ptEnableDenoiser) {
+            ImGui::Indent();
+            if (ImGui::Checkbox("Bypass NRD (show accum)", &mState.ptBypassNRDOutput))
+                ImGui::SetTooltip("Show raw accum buffer instead of denoised output (debug)");
+            if (ImGui::Checkbox("Denoiser comparison (L=denoised, R=raw)", &mState.ptDenoiserComparison))
+                ImGui::SetTooltip("Split screen: left half = NRD output, right half = raw accum");
+            ImGui::Unindent();
+        }
+        ImGui::Checkbox("Progressive Accumulation", &mState.ptProgressive);
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Split-Screen Comparison");
+    ImGui::Checkbox("Enable Split Screen", &mState.splitScreenEnabled);
+    if (mState.splitScreenEnabled) {
+        ImGui::SliderFloat("Split Position", &mState.splitScreenPos, 0.0f, 1.0f);
+
+        const char* splitNames[] = { "Rasterization", "Hybrid", "Full PT" };
+
+        int modeA = static_cast<int>(mState.splitModeA);
+        if (ImGui::Combo("Left Mode", &modeA, splitNames, 3))
+            mState.splitModeA = static_cast<DebugUIState::RenderMode>(modeA);
+
+        int modeB = static_cast<int>(mState.splitModeB);
+        if (ImGui::Combo("Right Mode", &modeB, splitNames, 3))
+            mState.splitModeB = static_cast<DebugUIState::RenderMode>(modeB);
+    }
+
+    if (!rtHW) {
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+                           "RT Pipeline not available: using rasterization fallback");
     }
 
     ImGui::End();

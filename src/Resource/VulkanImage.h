@@ -20,6 +20,11 @@ public:
                      uint32_t width, uint32_t height,
                      VkFormat format = VK_FORMAT_D32_SFLOAT);
 
+    /// Create a storage image for compute/RT shader read/write.
+    void CreateStorageImage(VmaAllocator allocator, VkDevice device,
+                            uint32_t width, uint32_t height,
+                            VkFormat format);
+
     void Destroy(VmaAllocator allocator, VkDevice device);
 
     VkImage     GetImage()     const { return mImage; }

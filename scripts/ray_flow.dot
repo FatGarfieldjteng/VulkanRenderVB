@@ -1,0 +1,47 @@
+digraph PathTracerRayFlow {
+    rankdir=TB;
+    splines=ortho;
+    nodesep=0.7;
+    ranksep=0.9;
+    fontname="Arial";
+    fontsize=11;
+    node [shape=box, style="rounded,filled", fontname=Arial, margin="0.2,0.15"];
+    edge [fontname=Arial, fontsize=9];
+
+    start [label="START\nPixel (i,j), RNG seed", fillcolor="#e3f2fd", color="#1565c0"];
+    ray [label="Generate primary ray\norigin=camera, dir=invViewProj*(uv+jitter)", fillcolor="#e3f2fd", color="#1565c0"];
+    trace [label="traceRayEXT(primary)\nsbtOffset=0, missIndex=0", fillcolor="#ede7f6", color="#5e35b1"];
+    hit_check [label="hitT < 0?", shape=diamond, fillcolor="#fff3e0", color="#e65100"];
+
+    env [label="Sample env map\ncolor += throughput * envColor", fillcolor="#e8f5e9", color="#2e7d32"];
+    sky_gbuf [label="Write sky G-buffer\nviewZ=600000", fillcolor="#e8f5e9", color="#2e7d32"];
+    exit_miss [label="Firefly clamp\nWrite outputs → EXIT", fillcolor="#ffebee", color="#c62828"];
+
+    payload [label="Closest-hit wrote payload\nhitPos, N, albedo, roughness, emissive", fillcolor="#ede7f6", color="#5e35b1"];
+    emissive [label="color += throughput * emissive\nFirst hit? → Write G-buffer", fillcolor="#e8f5e9", color="#2e7d32"];
+    direct [label="Direct lighting\nJitter sun → traceRayEXT(shadow)\nmiss → color += BRDF * radiance * NdotL", fillcolor="#e8f5e9", color="#2e7d32"];
+    bsdf [label="BSDF importance sampling\nFresnel → sample spec or diff\nthroughput *= bsdfWeight", fillcolor="#e8f5e9", color="#2e7d32"];
+    bounce_check [label="bounce > 1?", shape=diamond, fillcolor="#fff3e0", color="#e65100"];
+    rr_check [label="rand() > p?", shape=diamond, fillcolor="#fff3e0", color="#e65100"];
+    next_bounce [label="origin = hitPos + N*ε\ndirection = newDir\n(throughput /= p if RR)", fillcolor="#c8e6c9", color="#1b5e20"];
+    exit_loop [label="EXIT loop\n(RR break or max bounces)", fillcolor="#e3f2fd", color="#1565c0"];
+    final [label="Firefly clamp (cMax>50)\nWrite colorOutput, accumBuffer", fillcolor="#e3f2fd", color="#1565c0"];
+
+    start -> ray;
+    ray -> trace;
+    trace -> hit_check;
+    hit_check -> env [label="YES\n(miss)"];
+    hit_check -> payload [label="NO\n(hit)"];
+    env -> sky_gbuf;
+    sky_gbuf -> exit_miss;
+    payload -> emissive;
+    emissive -> direct;
+    direct -> bsdf;
+    bsdf -> bounce_check;
+    bounce_check -> next_bounce [label="NO"];
+    bounce_check -> rr_check [label="YES"];
+    rr_check -> exit_loop [label="YES"];
+    rr_check -> next_bounce [label="NO\n(throughput/=p)"];
+    next_bounce -> trace [label="loop"];
+    exit_loop -> final;
+}

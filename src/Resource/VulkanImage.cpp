@@ -134,6 +134,39 @@ void VulkanImage::CreateDepth(VmaAllocator allocator, VkDevice device,
     VK_CHECK(vkCreateImageView(device, &viewInfo, nullptr, &mView));
 }
 
+void VulkanImage::CreateStorageImage(VmaAllocator allocator, VkDevice device,
+                                      uint32_t width, uint32_t height,
+                                      VkFormat format) {
+    mWidth     = width;
+    mHeight    = height;
+    mMipLevels = 1;
+
+    VkImageCreateInfo imgInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    imgInfo.imageType     = VK_IMAGE_TYPE_2D;
+    imgInfo.format        = format;
+    imgInfo.extent        = {width, height, 1};
+    imgInfo.mipLevels     = 1;
+    imgInfo.arrayLayers   = 1;
+    imgInfo.samples       = VK_SAMPLE_COUNT_1_BIT;
+    imgInfo.tiling        = VK_IMAGE_TILING_OPTIMAL;
+    imgInfo.usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VmaAllocationCreateInfo allocInfo{};
+    allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+
+    VK_CHECK(vmaCreateImage(allocator, &imgInfo, &allocInfo, &mImage, &mAllocation, nullptr));
+
+    VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    viewInfo.image    = mImage;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format   = format;
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    VK_CHECK(vkCreateImageView(device, &viewInfo, nullptr, &mView));
+}
+
 void VulkanImage::GenerateMipmaps(const TransferManager& transfer, VkFormat /*format*/)
 {
     if (mMipLevels <= 1) return;

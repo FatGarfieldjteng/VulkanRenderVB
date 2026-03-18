@@ -48,6 +48,29 @@ struct DebugUIState {
     float rtLightRadius      = 0.02f;
     bool  rtAvailable        = false;
     bool  rtDebugShadowVis   = false;
+
+    // Render Mode (Phase 10)
+    enum class RenderMode : int {
+        Rasterization = 0,
+        Hybrid        = 1,
+        FullPathTracing = 2
+    };
+    RenderMode renderMode        = RenderMode::Rasterization;
+    bool       renderModeChanged = false;
+    bool       rtPipelineAvailable = false;
+
+    bool  splitScreenEnabled = false;
+    float splitScreenPos     = 0.5f;   // 0..1, left = mode A, right = mode B
+    RenderMode splitModeA    = RenderMode::Rasterization;
+    RenderMode splitModeB    = RenderMode::FullPathTracing;
+
+    // Path tracer settings
+    int   ptMaxBounces       = 8;
+    bool  ptEnableMIS        = true;
+    bool  ptEnableDenoiser   = true;
+    bool  ptProgressive      = true;
+    bool  ptBypassNRDOutput  = false;  // When denoiser on: show accum instead of NRD output (debug)
+    bool  ptDenoiserComparison = false;  // Split-screen: left=denoised, right=raw (for debugging)
 };
 
 class DebugUI {
@@ -82,6 +105,7 @@ private:
     void DrawMaterialEditorPanel(std::vector<GPUMaterialData>* materials);
     void DrawPostProcessPanel(PostProcessSettings* settings);
     void DrawToneMappingPanel(PostProcessSettings* settings);
+    void DrawRenderModePanel();
 
     VkDescriptorPool mDescriptorPool = VK_NULL_HANDLE;
     DebugUIState     mState;

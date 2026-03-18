@@ -1,0 +1,28 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D hdrOutput;
+layout(set = 0, binding = 1) uniform sampler2D ptInput;
+
+layout(push_constant) uniform PushConstants {
+    uvec2 resolution;
+    uint  splitLeft;
+    uint  splitRight;
+};
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(resolution)))) return;
+
+    // Split-screen: only write PT output within [splitLeft, splitRight)
+    if (uint(pixel.x) < splitLeft || uint(pixel.x) >= splitRight) return;
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(resolution);
+    vec3 ptColor = texture(ptInput, uv).rgb;
+
+    if (any(isnan(ptColor)) || any(isinf(ptColor))) ptColor = vec3(0.0);
+    ptColor = max(ptColor, vec3(0.0));
+
+    imageStore(hdrOutput, pixel, vec4(ptColor, 1.0));
+}

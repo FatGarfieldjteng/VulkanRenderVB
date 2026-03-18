@@ -257,12 +257,15 @@ void AccelStructure::CompactBLAS() {
 // ---------------------------------------------------------------------------
 // TLAS — one instance per renderable entity
 // ---------------------------------------------------------------------------
-void AccelStructure::BuildTLAS(const Registry& registry, const MeshPool& meshPool) {
+void AccelStructure::BuildTLAS(const Registry& registry, const MeshPool& meshPool,
+                               uint32_t numRayTypes) {
     std::vector<VkAccelerationStructureInstanceKHR> instances;
+    mInstanceInfos.clear();
     uint32_t instanceIdx = 0;
+    const auto& drawCmds = meshPool.GetDrawCommands();
 
     registry.ForEachRenderable(
-        [&](uint32_t, const TransformComponent& xform, const MeshComponent& mesh, const MaterialComponent&) {
+        [&](uint32_t, const TransformComponent& xform, const MeshComponent& mesh, const MaterialComponent& mat) {
             if (mesh.meshIndex >= static_cast<int>(mBLASEntries.size())) return;
             const auto& blas = mBLASEntries[mesh.meshIndex];
             if (blas.handle == VK_NULL_HANDLE) return;
@@ -277,15 +280,27 @@ void AccelStructure::BuildTLAS(const Registry& registry, const MeshPool& meshPoo
             VkTransformMatrixKHR xformMat{};
             for (int r = 0; r < 3; r++)
                 for (int c = 0; c < 4; c++)
-                    xformMat.matrix[r][c] = m[c][r]; // GLM is column-major, Vulkan is row-major
+                    xformMat.matrix[r][c] = m[c][r];
+
+            uint32_t matIdx = (mat.materialIndex >= 0)
+                                  ? static_cast<uint32_t>(mat.materialIndex) : 0u;
 
             inst.transform                              = xformMat;
             inst.instanceCustomIndex                    = instanceIdx;
             inst.mask                                   = 0xFF;
-            inst.instanceShaderBindingTableRecordOffset  = 0;
+            inst.instanceShaderBindingTableRecordOffset  = (numRayTypes > 0) ? matIdx * numRayTypes : 0;
             inst.flags                                  = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
             inst.accelerationStructureReference          = blasAddr;
             instances.push_back(inst);
+
+            const auto& cmd = drawCmds[mesh.meshIndex];
+            RTInstanceInfo info{};
+            info.vertexOffset  = cmd.vertexOffset;
+            info.firstIndex    = cmd.firstIndex;
+            info.indexCount    = cmd.indexCount;
+            info.materialIndex = matIdx;
+            mInstanceInfos.push_back(info);
+
             instanceIdx++;
         });
 
@@ -369,17 +384,20 @@ void AccelStructure::BuildTLAS(const Registry& registry, const MeshPool& meshPoo
 // ---------------------------------------------------------------------------
 // TLAS update (incremental rebuild for dynamic objects)
 // ---------------------------------------------------------------------------
-void AccelStructure::UpdateTLAS(const Registry& registry, const MeshPool& meshPool) {
+void AccelStructure::UpdateTLAS(const Registry& registry, const MeshPool& meshPool,
+                                uint32_t numRayTypes) {
     if (!mTLASBuilt) {
-        BuildTLAS(registry, meshPool);
+        BuildTLAS(registry, meshPool, numRayTypes);
         return;
     }
 
     std::vector<VkAccelerationStructureInstanceKHR> instances;
+    mInstanceInfos.clear();
     uint32_t instanceIdx = 0;
+    const auto& drawCmds = meshPool.GetDrawCommands();
 
     registry.ForEachRenderable(
-        [&](uint32_t, const TransformComponent& xform, const MeshComponent& mesh, const MaterialComponent&) {
+        [&](uint32_t, const TransformComponent& xform, const MeshComponent& mesh, const MaterialComponent& mat) {
             if (mesh.meshIndex >= static_cast<int>(mBLASEntries.size())) return;
             const auto& blas = mBLASEntries[mesh.meshIndex];
             if (blas.handle == VK_NULL_HANDLE) return;
@@ -396,13 +414,25 @@ void AccelStructure::UpdateTLAS(const Registry& registry, const MeshPool& meshPo
                 for (int c = 0; c < 4; c++)
                     xformMat.matrix[r][c] = m[c][r];
 
+            uint32_t matIdx = (mat.materialIndex >= 0)
+                                  ? static_cast<uint32_t>(mat.materialIndex) : 0u;
+
             inst.transform                              = xformMat;
             inst.instanceCustomIndex                    = instanceIdx;
             inst.mask                                   = 0xFF;
-            inst.instanceShaderBindingTableRecordOffset  = 0;
+            inst.instanceShaderBindingTableRecordOffset  = (numRayTypes > 0) ? matIdx * numRayTypes : 0;
             inst.flags                                  = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
             inst.accelerationStructureReference          = blasAddr;
             instances.push_back(inst);
+
+            const auto& cmd = drawCmds[mesh.meshIndex];
+            RTInstanceInfo info{};
+            info.vertexOffset  = cmd.vertexOffset;
+            info.firstIndex    = cmd.firstIndex;
+            info.indexCount    = cmd.indexCount;
+            info.materialIndex = matIdx;
+            mInstanceInfos.push_back(info);
+
             instanceIdx++;
         });
 

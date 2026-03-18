@@ -1,0 +1,250 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "pt_common.glsl"
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+layout(set = 0, binding = 1, rgba32f) uniform image2D colorOutput;
+layout(set = 0, binding = 2, rgba32f) uniform image2D accumBuffer;
+layout(set = 0, binding = 3, rgba16f) uniform image2D normalOutput;
+layout(set = 0, binding = 4, rgba8)   uniform image2D albedoOutput;
+layout(set = 0, binding = 5, r32f)    uniform image2D depthOutput;
+layout(set = 0, binding = 13, rg32f)  uniform image2D motionOutput;
+
+layout(set = 0, binding = 14) uniform FrameUBO {
+    mat4 viewProj;
+    mat4 prevViewProj;
+} frame;
+
+layout(push_constant) uniform PushConstants {
+    mat4  invViewProj;
+    vec4  cameraPosAndFrame;
+    vec4  sunDirAndRadius;
+    vec4  sunColorIntensity;
+    uvec4 params;
+};
+
+layout(location = 0) rayPayloadEXT HitPayload payload;
+layout(location = 1) rayPayloadEXT float shadowPayload;
+
+uint rngState;
+
+float rand01() {
+    rngState = pcgHash(rngState);
+    return float(rngState) / 4294967296.0;
+}
+
+vec2 rand2() { return vec2(rand01(), rand01()); }
+
+void main() {
+    ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+    ivec2 size  = ivec2(gl_LaunchSizeEXT.xy);
+
+    uint maxBounces  = params.x;
+    uint sampleOff   = params.y;
+    uint accumFrames = params.w;
+
+    rngState = pcgHash(pixel.x + pixel.y * size.x + sampleOff * size.x * size.y);
+
+    vec2 jitter = rand2() - 0.5;
+    vec2 uv = (vec2(pixel) + 0.5 + jitter) / vec2(size);
+    vec4 clip = vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+    vec4 worldTarget = invViewProj * clip;
+    vec3 target = worldTarget.xyz / worldTarget.w;
+
+    vec3 origin    = cameraPosAndFrame.xyz;
+    vec3 direction = normalize(target - origin);
+
+    vec3  color      = vec3(0.0);
+    vec3  throughput = vec3(1.0);
+    vec3  firstAlbedo = vec3(0.0);
+    vec3  firstNormal = vec3(0.0);
+    float firstDepth  = 0.0;
+    bool  firstHitRecorded = false;
+
+    for (uint bounce = 0; bounce < maxBounces; bounce++) {
+        traceRayEXT(tlas,
+            gl_RayFlagsOpaqueEXT,
+            0xFF,
+            0,     // sbtRecordOffset (primary)
+            2,     // sbtRecordStride (primary + shadow)
+            0,     // missIndex (primary miss)
+            origin, EPSILON, direction, 10000.0,
+            0);
+
+        if (payload.hitT < 0.0) {
+            color += throughput * payload.albedo;
+            if (!firstHitRecorded) {
+                firstAlbedo = payload.albedo;
+                firstHitRecorded = true;
+            }
+            break;
+        }
+
+        vec3 hitPos    = payload.hitPos;
+        vec3 N         = payload.normal;
+        vec3 surfAlbedo = payload.albedo;
+        float metallic  = payload.metallic;
+        float roughness = payload.roughness;
+        vec3 emissive   = payload.emissive;
+
+        // Emissive contribution
+        color += throughput * emissive;
+
+        // First-bounce: write denoiser G-buffer
+        if (!firstHitRecorded) {
+            firstAlbedo = surfAlbedo;
+            firstNormal = N;
+            firstDepth  = payload.hitT;
+            firstHitRecorded = true;
+
+            // NRD: normal.xyz + roughness in .w for IN_NORMAL_ROUGHNESS
+            imageStore(normalOutput, pixel, vec4(N, roughness));
+            imageStore(albedoOutput, pixel, vec4(surfAlbedo, 0.0));
+
+            // Linear view-space depth for NRD IN_VIEWZ (distance from camera)
+            imageStore(depthOutput, pixel, vec4(firstDepth, 0.0, 0.0, 0.0));
+
+            // Motion vector: prevUV - curUV (where to find history: prevUV = curUV + motion)
+            vec4 prevClip = frame.prevViewProj * vec4(hitPos, 1.0);
+            vec2 prevUV = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
+            vec2 curUV  = (vec2(pixel) + 0.5) / vec2(size);
+            vec2 motion = prevUV - curUV;
+            imageStore(motionOutput, pixel, vec4(motion, 0.0, 0.0));
+        }
+
+        vec3 V  = -direction;
+        vec3 F0 = mix(vec3(0.04), surfAlbedo, metallic);
+
+        // Direct lighting with shadow ray
+        vec3 L = normalize(sunDirAndRadius.xyz);
+        float NdotL = max(dot(N, L), 0.0);
+        if (NdotL > 0.0) {
+            float lRadius = sunDirAndRadius.w;
+            vec3 T_ = normalize(cross(L, abs(L.y) < 0.99 ? vec3(0,1,0) : vec3(1,0,0)));
+            vec3 B_ = cross(L, T_);
+            float angle_ = rand01() * 2.0 * PI;
+            float r_ = sqrt(rand01()) * lRadius;
+            vec3 jitteredL = normalize(L + T_ * cos(angle_) * r_ + B_ * sin(angle_) * r_);
+
+            shadowPayload = 0.0;
+            traceRayEXT(tlas,
+                gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+                0xFF,
+                1,     // sbtRecordOffset (shadow)
+                2,     // sbtRecordStride
+                1,     // missIndex (shadow miss)
+                hitPos + N * EPSILON, EPSILON, jitteredL, 10000.0,
+                1);
+
+            if (shadowPayload > 0.5) {
+                vec3 H = normalize(V + jitteredL);
+                float NdotH = max(dot(N, H), 0.0);
+                float VdotH = max(dot(V, H), 0.0);
+                float NdotV = max(dot(N, V), 0.001);
+                float a2 = roughness * roughness * roughness * roughness;
+
+                float D = DistributionGGX(NdotH, a2);
+                float G = GeometrySmith(NdotV, NdotL, a2);
+                vec3  F = FresnelSchlick(VdotH, F0);
+
+                vec3 spec = (D * G * F) / (4.0 * NdotV * NdotL + 0.0001);
+                vec3 kD = (1.0 - F) * (1.0 - metallic);
+                vec3 diff = kD * surfAlbedo * INV_PI;
+
+                vec3 radiance = sunColorIntensity.rgb * sunColorIntensity.w;
+                color += throughput * (diff + spec) * radiance * NdotL;
+            }
+        }
+
+        // BSDF importance sampling for next bounce
+        float NdotV = max(dot(N, V), 0.001);
+        vec3 F_avg = FresnelSchlick(NdotV, F0);
+        float specWeight = (F_avg.r + F_avg.g + F_avg.b) / 3.0;
+        float diffWeight = (1.0 - specWeight) * (1.0 - metallic);
+        float pSpec = clamp(specWeight / max(specWeight + diffWeight, 0.001), 0.1, 0.9);
+
+        vec3 newDir;
+        vec3 bsdfWeight;
+
+        if (rand01() < pSpec) {
+            float a = max(roughness * roughness, 0.001);
+            vec3 T_ = normalize(cross(N, abs(N.y) < 0.99 ? vec3(0,1,0) : vec3(1,0,0)));
+            vec3 B_ = cross(N, T_);
+            mat3 TBN = mat3(T_, B_, N);
+            vec3 Ve = transpose(TBN) * V;
+
+            vec3 Hlocal = sampleGGXVNDF(Ve, roughness, rand2());
+            vec3 H = TBN * Hlocal;
+            newDir = reflect(-V, H);
+
+            if (dot(newDir, N) <= 0.0) break;
+
+            float VdotH = max(dot(V, H), 0.0);
+            float NdotL_ = max(dot(N, newDir), 0.0);
+            float a2 = a * a;
+
+            vec3 F = FresnelSchlick(VdotH, F0);
+            float G = GeometrySmith(NdotV, NdotL_, a2);
+            float G1 = GeometrySmithG1(NdotV, a2);
+
+            bsdfWeight = F * (G / max(G1, 0.001));
+            bsdfWeight /= pSpec;
+        } else {
+            newDir = sampleCosineHemisphere(N, rand2());
+            vec3 kD = (1.0 - F_avg) * (1.0 - metallic);
+            bsdfWeight = kD * surfAlbedo;
+            bsdfWeight /= (1.0 - pSpec);
+        }
+
+        throughput *= bsdfWeight;
+
+        float tMax = max(throughput.r, max(throughput.g, throughput.b));
+        if (tMax > 2.0)
+            throughput *= 2.0 / tMax;
+
+        // Russian roulette after bounce 2
+        if (bounce > 1) {
+            float p = clamp(tMax, 0.05, 0.9);
+            if (rand01() > p) break;
+            throughput /= p;
+        }
+
+        origin    = hitPos + N * EPSILON;
+        direction = newDir;
+    }
+
+    // Miss on first ray: write default G-buffer values
+    // NRD: viewZ > denoisingRange marks sky/infinite - use large value so NRD skips denoising there
+    const float NRD_SKY_VIEWZ = 600000.0;  // > denoisingRange (500000)
+    if (!firstHitRecorded || firstDepth <= 0.0) {
+        imageStore(normalOutput, pixel, vec4(0.0));
+        imageStore(albedoOutput, pixel, vec4(firstAlbedo, 0.0));
+        imageStore(depthOutput, pixel, vec4(NRD_SKY_VIEWZ, 0.0, 0.0, 0.0));
+        imageStore(motionOutput, pixel, vec4(0.0));
+    }
+
+    // NaN / Inf protection
+    if (any(isnan(color)) || any(isinf(color))) color = vec3(0.0);
+    color = max(color, vec3(0.0));
+
+    // Firefly suppression
+    float cMax = max(color.r, max(color.g, color.b));
+    if (cMax > 50.0)
+        color *= 50.0 / cMax;
+
+    // Raw 1-SPP output for SVGF denoiser (must NOT be pre-accumulated)
+    imageStore(colorOutput, pixel, vec4(color, 1.0));
+
+    // Separate progressive accumulation buffer (used when denoiser is off)
+    vec4 prevAccum = imageLoad(accumBuffer, pixel);
+    vec4 newAccum;
+    if (accumFrames > 0) {
+        float w = 1.0 / float(accumFrames + 1);
+        newAccum = vec4(mix(prevAccum.rgb, color, w), 1.0);
+    } else {
+        newAccum = vec4(color, 1.0);
+    }
+    imageStore(accumBuffer, pixel, newAccum);
+}

@@ -1,0 +1,48 @@
+#version 460
+
+// Split-screen comparison: left = NRD denoised, right = raw accum
+// For debugging noise/overbright: compare denoiser output vs raw path trace
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D hdrOutput;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D denoisedInput;  // NRD output
+layout(set = 0, binding = 2, rgba32f) uniform readonly image2D accumInput;     // raw accum
+layout(set = 0, binding = 3, rgba8)   uniform readonly image2D albedoInput;
+
+layout(push_constant) uniform PushConstants {
+    uvec2 resolution;
+    uint  splitLeft;
+    uint  splitRight;
+    uint  compareSplitX;  // pixel x where denoised|raw split occurs
+} pc;
+
+vec3 yCoCgToLinear(vec3 ycocg) {
+    float t = ycocg.x - ycocg.z;
+    return max(vec3(t + ycocg.y, ycocg.x + ycocg.z, t - ycocg.y), vec3(0.0));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(pc.resolution)))) return;
+    if (uint(pixel.x) < pc.splitLeft || uint(pixel.x) >= pc.splitRight) return;
+
+    vec3 ptColor;
+    if (uint(pixel.x) < pc.compareSplitX) {
+        // Left: denoised (remodulate)
+        vec4 raw = imageLoad(denoisedInput, pixel);
+        vec3 irradiance = yCoCgToLinear(raw.rgb);
+        if (any(isnan(irradiance)) || any(isinf(irradiance))) irradiance = vec3(0.0);
+        irradiance = max(irradiance, vec3(0.0));
+
+        vec3 albedo = imageLoad(albedoInput, pixel).rgb;
+        albedo = pow(albedo, vec3(2.2));
+        vec3 effectiveAlbedo = max(albedo, vec3(0.12));
+        ptColor = irradiance * effectiveAlbedo;
+    } else {
+        // Right: raw accum (already linear radiance)
+        ptColor = imageLoad(accumInput, pixel).rgb;
+    }
+
+    ptColor = clamp(ptColor, vec3(0.0), vec3(100.0));
+    imageStore(hdrOutput, pixel, vec4(ptColor, 1.0));
+}

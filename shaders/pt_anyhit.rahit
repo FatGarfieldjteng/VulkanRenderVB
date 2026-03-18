@@ -1,0 +1,68 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_EXT_scalar_block_layout : require
+
+layout(scalar, set = 0, binding = 7) readonly buffer IndexBuffer { uint indices[]; };
+
+struct Vertex {
+    vec3 position;
+    vec3 normal;
+    vec2 texCoord;
+    vec4 tangent;
+};
+layout(scalar, set = 0, binding = 6) readonly buffer VertexBuffer { Vertex vertices[]; };
+
+struct MaterialParams {
+    vec4  baseColorFactor;
+    float metallicFactor;
+    float roughnessFactor;
+    uint  baseColorTexIdx;
+    uint  normalTexIdx;
+    uint  metallicRoughnessTexIdx;
+    uint  aoTexIdx;
+    uint  emissiveTexIdx;
+    float _pad;
+};
+layout(set = 0, binding = 8) readonly buffer MaterialBuffer { MaterialParams materials[]; };
+
+struct InstanceInfo {
+    int  vertexOffset;
+    uint firstIndex;
+    uint indexCount;
+    uint materialIndex;
+};
+layout(set = 0, binding = 9) readonly buffer InstanceBuffer { InstanceInfo instanceInfos[]; };
+
+layout(set = 1, binding = 0) uniform sampler2D textures[];
+
+hitAttributeEXT vec2 attribs;
+
+void main() {
+    uint instIdx = gl_InstanceCustomIndexEXT;
+    InstanceInfo info = instanceInfos[instIdx];
+
+    uint i0 = indices[info.firstIndex + gl_PrimitiveID * 3 + 0];
+    uint i1 = indices[info.firstIndex + gl_PrimitiveID * 3 + 1];
+    uint i2 = indices[info.firstIndex + gl_PrimitiveID * 3 + 2];
+
+    Vertex v0 = vertices[uint(int(i0) + info.vertexOffset)];
+    Vertex v1 = vertices[uint(int(i1) + info.vertexOffset)];
+    Vertex v2 = vertices[uint(int(i2) + info.vertexOffset)];
+
+    vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+    vec2 uv   = v0.texCoord * bary.x + v1.texCoord * bary.y + v2.texCoord * bary.z;
+
+    MaterialParams mat = materials[info.materialIndex];
+    float alpha = mat.baseColorFactor.a *
+        texture(textures[nonuniformEXT(mat.baseColorTexIdx)], uv).a;
+
+    // Stochastic alpha test using ray payload hash as random
+    uint seed = gl_LaunchIDEXT.x + gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x;
+    seed = seed * 747796405u + 2891336453u;
+    float threshold = float(seed) / 4294967296.0;
+
+    if (alpha < threshold) {
+        ignoreIntersectionEXT;
+    }
+}

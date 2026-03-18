@@ -24,7 +24,9 @@ void DescriptorManager::Initialize(VkDevice device) {
     binding.binding         = 0;
     binding.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     binding.descriptorCount = MAX_TEXTURES;
-    binding.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    binding.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT
+                              | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
+                              | VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
 
     VkDescriptorBindingFlags bindingFlags =
         VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |

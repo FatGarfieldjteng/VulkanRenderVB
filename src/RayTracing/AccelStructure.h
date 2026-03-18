@@ -19,19 +19,25 @@ struct BLASEntry {
     VkDeviceSize               compactedSize = 0;
 };
 
+struct RTInstanceInfo;
+
 class AccelStructure {
 public:
     void Initialize(VkDevice device, VmaAllocator allocator, const TransferManager& transfer);
     void Shutdown(VmaAllocator allocator);
 
     void BuildBLAS(const MeshPool& meshPool);
-    void BuildTLAS(const Registry& registry, const MeshPool& meshPool);
-    void UpdateTLAS(const Registry& registry, const MeshPool& meshPool);
+    void BuildTLAS(const Registry& registry, const MeshPool& meshPool,
+                   uint32_t numRayTypes = 0);
+    void UpdateTLAS(const Registry& registry, const MeshPool& meshPool,
+                    uint32_t numRayTypes = 0);
 
     VkAccelerationStructureKHR GetTLAS() const { return mTLAS; }
     VkDeviceSize GetTotalBLASMemory() const { return mTotalBLASMemory; }
     VkDeviceSize GetTotalBLASMemoryPreCompaction() const { return mTotalBLASMemoryPreCompaction; }
     VkDeviceSize GetTLASMemory() const { return mTLASBuffer.GetSize(); }
+
+    const std::vector<RTInstanceInfo>& GetInstanceInfos() const { return mInstanceInfos; }
 
 private:
     void CompactBLAS();
@@ -48,4 +54,13 @@ private:
     VulkanBuffer mTLASBuffer;
     VulkanBuffer mInstanceBuffer;
     bool         mTLASBuilt = false;
+
+    std::vector<RTInstanceInfo> mInstanceInfos;
+};
+
+struct RTInstanceInfo {
+    int32_t  vertexOffset;
+    uint32_t firstIndex;
+    uint32_t indexCount;
+    uint32_t materialIndex;
 };

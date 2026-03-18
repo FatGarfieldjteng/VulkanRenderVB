@@ -404,3 +404,21 @@ The instance buffer, on the other hand, requires 16-byte alignment for its devic
 | Vertex/index buffers in BLAS | Per-format alignment (e.g., 4 for R32) | Driver/VMA — standard buffer alignment covers this |
 
 The key distinction: buffer memory alignment is handled automatically by the allocator, but acceleration structure build requirements (like scratch alignment) are additional constraints the application must enforce explicitly.
+
+### Q: Why implement RT Shadows in a compute shader rather than a fragment shader?
+
+RTShadows uses `GL_EXT_ray_query` in a **compute shader**, not in a fragment shader. You *could* use `GL_EXT_ray_query` inside a fragment shader (it's supported there too), but compute is preferred here for several reasons:
+
+**1. No geometry or render pass needed.** A fragment shader requires a rasterization pipeline — you'd have to draw a fullscreen triangle/quad, set up a render pass (or dynamic rendering), create a graphics pipeline with vertex/fragment stages, configure a framebuffer, etc. The RT Shadows pass doesn't rasterize anything. It reads depth, reconstructs world positions, and traces shadow rays. A compute dispatch is simpler: just `vkCmdDispatch((width+7)/8, (height+7)/8, 1)`.
+
+**2. Output to storage images.** The shadow output is `image2D shadowOutput` written via `imageStore`. Fragment shaders write to color attachments, not storage images. They *can* write to storage images, but then you lose the advantages of fragment shaders (rasterization, blending, depth testing) and gain nothing over compute.
+
+**3. Better work distribution for ray tracing.** Fragment shaders are scheduled per-pixel by the rasterizer's fixed-function hardware. Compute shaders have explicit workgroup sizing (`local_size_x = 8, local_size_y = 8`). For ray tracing workloads, where nearby pixels often trace rays in similar directions (spatial coherence in the TLAS), the 8×8 tile grouping maps well to the GPU's warp/wavefront organization. The driver has more freedom to schedule work efficiently without the rasterizer's constraints.
+
+**4. No dependency on the graphics pipeline state.** The shadow trace runs as a standalone pass between the forward pass and the final composite. In compute, it only needs the TLAS, depth texture, and push constants. In a fragment shader, you'd need to set up viewport, scissor, a dummy vertex shader, disable depth testing, configure color writes — boilerplate that adds nothing.
+
+**5. The denoise pass is also compute.** After the trace, `RTShadows::Denoise()` runs 3 iterations of an A-Trous bilateral filter, also as compute dispatches. Keeping both trace and denoise as compute passes means uniform barrier handling (compute → compute) and no render pass transitions in between. If the trace were a fragment shader, you'd need a render pass begin/end, then transition back to compute for the denoise — extra complexity for no benefit.
+
+**6. Decoupled from screen resolution and triangle count.** A compute dispatch doesn't need a framebuffer or know about the rasterization viewport. The resolution comes in via push constants. This makes the class trivially resizable (`Resize()` just recreates the images) without touching any pipeline state.
+
+A full ray tracing pipeline (`VK_KHR_ray_tracing_pipeline` with `vkCmdTraceRaysKHR`) would also be overkill for shadows: shadow rays only need a binary hit/miss result with no material evaluation, no closest-hit processing, and no BSDF sampling. `GL_EXT_ray_query` gives exactly that — a simple inline ray-scene intersection test — without requiring an SBT or shader groups.

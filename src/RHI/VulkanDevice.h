@@ -29,7 +29,11 @@ public:
 
     const QueueFamilyIndices& GetQueueFamilyIndices() const { return mQueueFamilyIndices; }
 
-    bool IsRayTracingSupported() const { return mRayTracingSupported; }
+    bool IsRayTracingSupported()         const { return mRayTracingSupported; }
+    bool IsRTPipelineSupported()         const { return mRTPipelineSupported; }
+
+    const VkPhysicalDeviceRayTracingPipelinePropertiesKHR&
+        GetRTPipelineProperties() const { return mRTPipelineProps; }
 
     void WaitIdle() const;
 
@@ -39,6 +43,7 @@ private:
     QueueFamilyIndices FindQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR surface) const;
     bool CheckDeviceExtensionSupport(VkPhysicalDevice device) const;
     bool CheckRayTracingSupport(VkPhysicalDevice device) const;
+    bool CheckRTPipelineSupport(VkPhysicalDevice device) const;
 
     VkPhysicalDevice   mPhysicalDevice = VK_NULL_HANDLE;
     VkDevice           mDevice         = VK_NULL_HANDLE;
@@ -50,5 +55,9 @@ private:
 
     QueueFamilyIndices mQueueFamilyIndices;
     VkSurfaceKHR       mSurface = VK_NULL_HANDLE;
-    bool               mRayTracingSupported = false;
+    bool               mRayTracingSupported  = false;
+    bool               mRTPipelineSupported  = false;
+
+    VkPhysicalDeviceRayTracingPipelinePropertiesKHR mRTPipelineProps{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR};
 };

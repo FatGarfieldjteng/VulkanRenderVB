@@ -36,15 +36,21 @@
 #include "RayTracing/AccelStructure.h"
 #include "RayTracing/RTShadows.h"
 #include "RayTracing/RTReflections.h"
+#include "RayTracing/PathTracer.h"
+#include "RayTracing/NRDDenoiser.h"
 
+#include <optional>
 #include <string>
 #include <vector>
 
 class Application {
 public:
+    ~Application();
     void Run();
     void RunBenchmark(uint32_t frameCount, bool gpuDriven, bool occlusionCulling);
     void SetScenePath(const std::string& path) { mScenePathOverride = path; }
+    void SetInitialRenderMode(DebugUIState::RenderMode mode) { mInitialRenderMode = mode; }
+    void SetInitialDenoiser(bool on) { mInitialDenoiser = on; }
 
 private:
     void InitWindow();
@@ -191,6 +197,46 @@ private:
     void InitRayTracing();
     void ShutdownRayTracing();
 
+    // --- Ray Tracing Pipeline (Phase 10) ---
+    bool            mRTPipelineSupported = false;
+    PathTracer      mPathTracer;
+    NRDDenoiser     mNRDDenoiser;
+
+    VkPipeline       mPTCompositePipeline   = VK_NULL_HANDLE;
+    VkPipelineLayout mPTCompositePipeLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout mPTCompositeDescLayout = VK_NULL_HANDLE;
+    VkDescriptorPool mPTCompositeDescPool   = VK_NULL_HANDLE;
+    VkDescriptorSet  mPTCompositeDescSet    = VK_NULL_HANDLE;
+
+    // Denoise composite: uses imageLoad for B10G11R11 (texture() can produce wrong colors)
+    VkPipeline       mPTCompositeDenoisePipeline   = VK_NULL_HANDLE;
+    VkPipelineLayout mPTCompositeDenoisePipeLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout mPTCompositeDenoiseDescLayout = VK_NULL_HANDLE;
+    VkDescriptorPool mPTCompositeDenoiseDescPool   = VK_NULL_HANDLE;
+    VkDescriptorSet  mPTCompositeDenoiseDescSet    = VK_NULL_HANDLE;
+
+    // Compare composite: split-screen L=denoised, R=raw (for debugging)
+    VkPipeline       mPTCompositeComparePipeline   = VK_NULL_HANDLE;
+    VkPipelineLayout mPTCompositeComparePipeLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout mPTCompositeCompareDescLayout = VK_NULL_HANDLE;
+    VkDescriptorPool mPTCompositeCompareDescPool   = VK_NULL_HANDLE;
+    VkDescriptorSet  mPTCompositeCompareDescSet    = VK_NULL_HANDLE;
+
+    VkSampler        mPTSampler             = VK_NULL_HANDLE;
+    bool             mPTCompositeDescDirty  = true;
+
+    // NRD needs prev frame view/proj for temporal reprojection
+    glm::mat4        mPTViewMatPrev{1.0f};
+    glm::mat4        mPTProjMatPrev{1.0f};
+    bool             mPTFirstNRDFrame       = true;
+
+    DebugUIState::RenderMode mActiveRenderMode = DebugUIState::RenderMode::Rasterization;
+
+    void InitRTPipeline();
+    void ShutdownRTPipeline();
+    void UpdatePTCompositeDescriptors();
+    void RebuildRenderGraphForMode(DebugUIState::RenderMode mode);
+
     // --- MSAA ---
     std::vector<VkSampleCountFlagBits> mSupportedMSAA;
     VkSampleCountFlagBits mCurrentMSAA = VK_SAMPLE_COUNT_1_BIT;
@@ -223,4 +269,8 @@ private:
     // --- scene override ---
     std::string mScenePathOverride;
     SceneType   mCurrentScene = SceneType::TestScene;
+
+    // --- CLI overrides for render mode / denoiser ---
+    std::optional<DebugUIState::RenderMode> mInitialRenderMode;
+    std::optional<bool> mInitialDenoiser;
 };
